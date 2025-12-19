@@ -18,7 +18,6 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Loca
 # ───────────────────────── CONFIG ─────────────────────────
 
 ABCEX_URL = os.getenv("ABCEX_URL", "https://abcex.io/client/spot/USDTRUB")
-
 SOURCE = os.getenv("SOURCE", "abcex")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
@@ -29,37 +28,29 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-# Должно совпадать с unique index в БД:
-# create unique index ... (source, symbol, trade_time, price, volume_usdt)
+# unique index должен совпадать:
+# (source, symbol, trade_time, price, volume_usdt)
 ON_CONFLICT = os.getenv("ON_CONFLICT", "source,symbol,trade_time,price,volume_usdt")
 
-# Сколько строк с UI брать за проход
-LIMIT = int(os.getenv("LIMIT", os.getenv("MAX_TRADES", "200")))
+LIMIT = int(os.getenv("LIMIT", "200"))
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", os.getenv("POLL_SEC", "1")))
 
-# Частота опроса
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", os.getenv("POLL_SEC", "1.0")))
-
-# Таймауты и стабильность
 SCRAPE_TIMEOUT_SECONDS = float(os.getenv("SCRAPE_TIMEOUT_SECONDS", "25"))
 UPSERT_TIMEOUT_SECONDS = float(os.getenv("UPSERT_TIMEOUT_SECONDS", "25"))
 HEARTBEAT_SECONDS = float(os.getenv("HEARTBEAT_SECONDS", "30"))
 RELOAD_EVERY_SECONDS = float(os.getenv("RELOAD_EVERY_SECONDS", "600"))
 
-# Дедупликация в памяти
 SEEN_MAX = int(os.getenv("SEEN_MAX", "20000"))
 UPSERT_BATCH = int(os.getenv("UPSERT_BATCH", "200"))
 
-# Playwright install поведение
-SKIP_BROWSER_INSTALL = os.getenv("SKIP_BROWSER_INSTALL", "0") == "1"
-
-# storage_state (сессия). На Render это может помочь пережить "внутренние" перезапуски процесса,
-# но при новом деплое файл исчезнет — это нормально.
 STATE_PATH = os.getenv("STATE_PATH", "abcex_state.json")
 
-# Точность numeric(18,8)
+# numeric(18,8)
 Q8 = Decimal("0.00000001")
 
-# Логи: чтобы Render не буферизовал вывод
+TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+
+# Render: не буферизуем stdout
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
@@ -72,25 +63,61 @@ logging.basicConfig(
 )
 log = logging.getLogger("abcex-worker")
 
-TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+
+# ───────────────────────── PLAYWRIGHT BROWSERS INSTALL (как в Rapira) ─────────────────────────
+
+def ensure_playwright_browsers() -> None:
+    """
+    Гарантируем, что нужные браузеры для Playwright скачаны.
+
+    ВАЖНО:
+    - только download (без системных deps)
+    - никаких su / --with-deps
+    """
+    try:
+        log.info("Ensuring Playwright Chromium is installed ...")
+        result = subprocess.run(
+            ["playwright", "install", "chromium", "chromium-headless-shell"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            log.info("Playwright Chromium is installed (or already present).")
+        else:
+            log.error(
+                "playwright install returned code %s\nSTDOUT:\n%s\nSTDERR:\n%s",
+                result.returncode,
+                result.stdout,
+                result.stderr,
+            )
+    except FileNotFoundError:
+        log.error(
+            "playwright CLI not found in PATH. "
+            "Убедись, что Playwright установлен через pip и доступен как 'playwright'."
+        )
+    except Exception as e:
+        log.error("Unexpected error while installing Playwright browsers: %s", e)
+
+
+def _is_missing_browser_error(e: Exception) -> bool:
+    s = str(e)
+    return (
+        "Executable doesn't exist" in s
+        or "playwright install" in s
+        or "chromium_headless_shell" in s
+        or ("ms-playwright" in s and "doesn't exist" in s)
+    )
 
 
 # ───────────────────────── NUM HELPERS ─────────────────────────
 
 def normalize_decimal(text: str) -> Optional[Decimal]:
-    """
-    Преобразует числа вида:
-      '191 889.47' / '191 889,47' / '79,80' / '1,005.70'
-    в Decimal.
-    """
     t = (text or "").strip().replace("\xa0", " ")
     if not t:
         return None
 
-    # убираем пробелы-разделители тысяч
     t = t.replace(" ", "")
-
-    # если одновременно ',' и '.', часто это "1,234.56"
     if "," in t and "." in t:
         t = t.replace(",", "")
     else:
@@ -104,51 +131,6 @@ def normalize_decimal(text: str) -> Optional[Decimal]:
 
 def q8_str(x: Decimal) -> str:
     return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
-
-
-# ───────────────────────── PLAYWRIGHT INSTALL ─────────────────────────
-
-_last_install_ts = 0.0
-
-def _playwright_install() -> None:
-    """
-    Runtime-установка браузеров. Не требует менять команды Render.
-    Ставим и chromium, и chromium-headless-shell (частая причина падений).
-    """
-    global _last_install_ts
-    now = time.time()
-    if now - _last_install_ts < 600:
-        log.warning("Playwright install attempted recently; skipping (cooldown).")
-        return
-    _last_install_ts = now
-
-    log.warning("Installing Playwright browsers (runtime)...")
-    try:
-        r = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode != 0:
-            log.error(
-                "playwright install failed (%s)\nSTDOUT:\n%s\nSTDERR:\n%s",
-                r.returncode, r.stdout, r.stderr
-            )
-        else:
-            log.info("Playwright browsers installed.")
-    except Exception as e:
-        log.error("Cannot run playwright install: %s", e)
-
-
-def _should_force_install(err: Exception) -> bool:
-    s = str(err)
-    return (
-        "Executable doesn't exist" in s
-        or "playwright install" in s
-        or "chromium_headless_shell" in s
-        or ("ms-playwright" in s and "doesn't exist" in s)
-    )
 
 
 # ───────────────────────── SUPABASE ─────────────────────────
@@ -188,7 +170,7 @@ async def supabase_upsert(rows: List[Dict[str, Any]]) -> None:
         log.info("Inserted (or ignored duplicates) %d rows into '%s'.", len(rows), SUPABASE_TABLE)
 
 
-# ───────────────────────── COOKIE / LOGIN HELPERS ─────────────────────────
+# ───────────────────────── PAGE HELPERS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
     candidates = ["Принять", "Согласен", "Я согласен", "Accept", "I agree"]
@@ -237,7 +219,6 @@ async def login_if_needed(page: Page) -> None:
         "input[placeholder*='password' i]",
     ]
 
-    # fill email
     email_filled = False
     for sel in email_candidates:
         loc = page.locator(sel)
@@ -249,7 +230,6 @@ async def login_if_needed(page: Page) -> None:
         except Exception:
             continue
 
-    # fill password
     pw_filled = False
     for sel in pw_candidates:
         loc = page.locator(sel)
@@ -264,7 +244,6 @@ async def login_if_needed(page: Page) -> None:
     if not email_filled or not pw_filled:
         raise RuntimeError("Could not find visible email/password fields (UI changed or blocked).")
 
-    # click login button
     btn_texts = ["Войти", "Вход", "Sign in", "Login", "Войти в аккаунт"]
     clicked = False
     for t in btn_texts:
@@ -283,7 +262,6 @@ async def login_if_needed(page: Page) -> None:
         except Exception:
             pass
 
-    # wait for potential navigation
     try:
         await page.wait_for_timeout(800)
         await page.wait_for_load_state("domcontentloaded", timeout=30_000)
@@ -298,8 +276,6 @@ async def login_if_needed(page: Page) -> None:
     log.info("Login successful (form disappeared).")
 
 
-# ───────────────────────── UI NAV + PARSING ─────────────────────────
-
 async def click_trades_tab_best_effort(page: Page) -> None:
     candidates = ["Сделки", "История", "Order history", "Trades"]
     for t in candidates:
@@ -308,7 +284,6 @@ async def click_trades_tab_best_effort(page: Page) -> None:
             if await tab.count() > 0 and await tab.first.is_visible():
                 await tab.first.click(timeout=8_000)
                 await page.wait_for_timeout(400)
-                log.info("Clicked tab: %s", t)
                 return
         except Exception:
             continue
@@ -319,7 +294,6 @@ async def click_trades_tab_best_effort(page: Page) -> None:
             if await tab.count() > 0 and await tab.first.is_visible():
                 await tab.first.click(timeout=8_000)
                 await page.wait_for_timeout(400)
-                log.info("Clicked text tab: %s", t)
                 return
         except Exception:
             continue
@@ -343,9 +317,6 @@ async def get_order_history_panel(page: Page) -> Locator:
 
 
 async def wait_trades_visible(panel: Locator, timeout_ms: int = 25_000) -> None:
-    """
-    Ждём появления HH:MM:SS внутри panel-orderHistory.
-    """
     handle = await panel.element_handle()
     if handle is None:
         raise RuntimeError("Cannot get element_handle(panel).")
@@ -369,30 +340,7 @@ async def wait_trades_visible(panel: Locator, timeout_ms: int = 25_000) -> None:
     raise RuntimeError("Trades not visible (no HH:MM:SS detected in panel).")
 
 
-@dataclass(frozen=True)
-class TradeKey:
-    source: str
-    symbol: str
-    trade_time: str
-    price: str
-    volume_usdt: str
-
-
-def trade_key(t: Dict[str, Any]) -> TradeKey:
-    return TradeKey(
-        source=t["source"],
-        symbol=t["symbol"],
-        trade_time=t["trade_time"],
-        price=t["price"],
-        volume_usdt=t["volume_usdt"],
-    )
-
-
 async def extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str, Any]]:
-    """
-    Возвращает список dict, готовых для вставки в БД:
-      {source, symbol, price, volume_usdt, volume_rub, trade_time}
-    """
     handle = await panel.element_handle()
     if handle is None:
         raise RuntimeError("Cannot get element_handle(panel).")
@@ -417,7 +365,6 @@ async def extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str
             if (!isNum(price_raw) || !isNum(qty_raw)) continue;
 
             out.push({ price_raw, qty_raw, time: time_txt });
-
             if (out.length >= limit) break;
           }
 
@@ -451,12 +398,37 @@ async def extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str
     return out
 
 
+# ───────────────────────── DEDUPE KEY ─────────────────────────
+
+@dataclass(frozen=True)
+class TradeKey:
+    source: str
+    symbol: str
+    trade_time: str
+    price: str
+    volume_usdt: str
+
+
+def trade_key(t: Dict[str, Any]) -> TradeKey:
+    return TradeKey(
+        source=t["source"],
+        symbol=t["symbol"],
+        trade_time=t["trade_time"],
+        price=t["price"],
+        volume_usdt=t["volume_usdt"],
+    )
+
+
 # ───────────────────────── BROWSER SESSION ─────────────────────────
 
 async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     browser = await pw.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ],
     )
 
     storage_state = STATE_PATH if os.path.exists(STATE_PATH) else None
@@ -476,20 +448,18 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     page.set_default_timeout(10_000)
 
     await page.goto(ABCEX_URL, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_timeout(1_200)
-    await accept_cookies_if_any(page)
+    await page.wait_for_timeout(1500)
 
-    # логин при необходимости
+    await accept_cookies_if_any(page)
     await login_if_needed(page)
 
-    # сохранить state (best effort)
+    # save state (best effort)
     try:
         await context.storage_state(path=STATE_PATH)
         log.info("Saved session state to %s", STATE_PATH)
     except Exception as e:
         log.info("Could not save storage state: %s", e)
 
-    # best effort открыть вкладку "Сделки"
     await click_trades_tab_best_effort(page)
     await page.wait_for_timeout(400)
 
@@ -514,8 +484,6 @@ async def safe_close(browser: Optional[Browser], context: Optional[BrowserContex
         pass
 
 
-# ───────────────────────── SCRAPE WINDOW ─────────────────────────
-
 async def scrape_window(page: Page) -> List[Dict[str, Any]]:
     panel = await get_order_history_panel(page)
     await wait_trades_visible(panel, timeout_ms=25_000)
@@ -525,6 +493,9 @@ async def scrape_window(page: Page) -> List[Dict[str, Any]]:
 # ───────────────────────── WORKER LOOP ─────────────────────────
 
 async def worker() -> None:
+    # ВАЖНО: ставим браузеры ДО первого launch (как в рабочем Rapira)
+    ensure_playwright_browsers()
+
     seen: Set[TradeKey] = set()
     seen_q: Deque[TradeKey] = deque()
 
@@ -545,8 +516,9 @@ async def worker() -> None:
                     try:
                         browser, context, page = await open_browser(pw)
                     except Exception as e:
-                        if (not SKIP_BROWSER_INSTALL) or _should_force_install(e):
-                            _playwright_install()
+                        # если не хватает браузера — ставим и пробуем снова
+                        if _is_missing_browser_error(e):
+                            ensure_playwright_browsers()
                             browser, context, page = await open_browser(pw)
                         else:
                             raise
@@ -563,7 +535,7 @@ async def worker() -> None:
                 if time.monotonic() - last_reload >= RELOAD_EVERY_SECONDS:
                     log.warning("Maintenance reload...")
                     await page.goto(ABCEX_URL, wait_until="domcontentloaded", timeout=60_000)
-                    await page.wait_for_timeout(1_200)
+                    await page.wait_for_timeout(1500)
                     await accept_cookies_if_any(page)
                     await login_if_needed(page)
                     await click_trades_tab_best_effort(page)
@@ -580,7 +552,7 @@ async def worker() -> None:
                 if not window:
                     log.warning("No trades parsed. Reloading page...")
                     await page.goto(ABCEX_URL, wait_until="domcontentloaded", timeout=60_000)
-                    await page.wait_for_timeout(1_200)
+                    await page.wait_for_timeout(1500)
                     await accept_cookies_if_any(page)
                     await login_if_needed(page)
                     await click_trades_tab_best_effort(page)
@@ -607,7 +579,6 @@ async def worker() -> None:
                              json.dumps(new_rows[-1], ensure_ascii=False))
                     await supabase_upsert(new_rows)
 
-                # jittered sleep
                 sleep_s = max(0.35, POLL_SECONDS + random.uniform(-0.15, 0.15))
                 await asyncio.sleep(sleep_s)
 
@@ -619,8 +590,9 @@ async def worker() -> None:
             except Exception as e:
                 log.error("Worker error: %s", e)
 
-                if (not SKIP_BROWSER_INSTALL) or _should_force_install(e):
-                    _playwright_install()
+                # если это снова “нет браузера” — ставим прямо сейчас (без cooldown)
+                if _is_missing_browser_error(e):
+                    ensure_playwright_browsers()
 
                 log.info("Retrying after %.1fs ...", backoff)
                 await asyncio.sleep(backoff)
