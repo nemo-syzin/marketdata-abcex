@@ -4,16 +4,19 @@ import logging
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import httpx
 from playwright.async_api import async_playwright, Browser, BrowserContext, Locator, Page
+
 
 # ───────────────────────── CONFIG ─────────────────────────
 
@@ -28,7 +31,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-# Должно совпадать с unique index в БД (пример):
+# Должно совпадать с unique index в БД:
 # create unique index ... (source, symbol, trade_time, price, volume_usdt)
 ON_CONFLICT = os.getenv("ON_CONFLICT", "source,symbol,trade_time,price,volume_usdt")
 
@@ -49,7 +52,7 @@ STATE_PATH = os.getenv("STATE_PATH", "abcex_state.json")
 Q8 = Decimal("0.00000001")
 TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
 
-# Render: не буферизуем stdout
+# Render: stdout line-buffered
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
@@ -62,8 +65,139 @@ logging.basicConfig(
 )
 log = logging.getLogger("abcex-worker")
 
+# Опционально: подробные логи Playwright при проблемах запуска браузера
+# (Playwright рекомендует DEBUG=pw:browser* для диагностики launch-ошибок)
+if os.getenv("PW_DEBUG", "0") == "1":
+    os.environ["DEBUG"] = os.environ.get("DEBUG", "pw:browser*")
+    log.warning("PW_DEBUG=1 -> DEBUG=%s", os.environ["DEBUG"])
+
+
+# ───────────────────────── DIAGNOSTICS ─────────────────────────
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def log_env_snapshot() -> None:
+    try:
+        import playwright  # type: ignore
+
+        pw_ver = getattr(playwright, "__version__", "unknown")
+    except Exception:
+        pw_ver = "unknown"
+
+    log.info("========== ENV SNAPSHOT ==========")
+    log.info("time=%s", _now())
+    log.info("python=%s", sys.version.replace("\n", " "))
+    log.info("playwright_version=%s", pw_ver)
+    log.info("cwd=%s", os.getcwd())
+    log.info("ABCEX_URL=%s", ABCEX_URL)
+    log.info("SUPABASE_URL_set=%s", bool(SUPABASE_URL))
+    log.info("STATE_PATH=%s exists=%s", STATE_PATH, os.path.exists(STATE_PATH))
+    log.info("PW_DEBUG=%s DEBUG=%s", os.getenv("PW_DEBUG", "0"), os.getenv("DEBUG", ""))
+    try:
+        usage = shutil.disk_usage("/")
+        log.info("disk_free_root=%0.2f GB", usage.free / (1024**3))
+    except Exception as e:
+        log.info("disk_usage failed: %s", e)
+    log.info("==================================")
+
+
+def _candidate_ms_playwright_dirs() -> List[Path]:
+    """
+    Где Playwright обычно хранит браузеры на Linux:
+    - ~/.cache/ms-playwright
+    - (на Render часто) /opt/render/.cache/ms-playwright
+    """
+    dirs: List[Path] = []
+    home = Path.home()
+    dirs.append(home / ".cache" / "ms-playwright")
+
+    # Render
+    dirs.append(Path("/opt/render/.cache/ms-playwright"))
+
+    # Иногда кэшируют в проекте
+    dirs.append(Path(os.getcwd()) / ".cache" / "ms-playwright")
+
+    # Пользовательский путь (если ты захочешь задать env на Render)
+    # PLAYWRIGHT_BROWSERS_PATH может быть "0" — тогда это спец-режим,
+    # здесь мы не интерпретируем "0" как путь.
+    p = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if p and p != "0":
+        dirs.insert(0, Path(p))
+
+    # Уникализируем
+    seen: Set[str] = set()
+    out: List[Path] = []
+    for d in dirs:
+        s = str(d)
+        if s not in seen:
+            seen.add(s)
+            out.append(d)
+    return out
+
+
+def _find_headless_shell() -> Optional[Path]:
+    """
+    Ищем бинарник headless_shell, которого не хватает в твоих логах:
+    .../chromium_headless_shell-1148/chrome-linux/headless_shell
+    """
+    for base in _candidate_ms_playwright_dirs():
+        try:
+            if not base.exists():
+                continue
+            # ищем chromium_headless_shell-*/chrome-linux/headless_shell
+            matches = list(base.glob("chromium_headless_shell-*/chrome-linux/headless_shell"))
+            if matches:
+                return matches[0]
+        except Exception:
+            continue
+    return None
+
+
+def _find_chromium_exe() -> Optional[Path]:
+    """
+    На всякий случай ищем и обычный Chromium:
+    .../chromium-1148/chrome-linux/chrome
+    """
+    for base in _candidate_ms_playwright_dirs():
+        try:
+            if not base.exists():
+                continue
+            matches = list(base.glob("chromium-*/chrome-linux/chrome"))
+            if matches:
+                return matches[0]
+        except Exception:
+            continue
+    return None
+
+
+def log_browser_inventory() -> None:
+    log.info("========== BROWSER INVENTORY ==========")
+    for d in _candidate_ms_playwright_dirs():
+        try:
+            log.info("ms-playwright dir: %s exists=%s", d, d.exists())
+            if d.exists():
+                # покажем верхний уровень
+                children = sorted([p.name for p in d.iterdir()])[:30]
+                log.info("  children (first 30): %s", children)
+        except Exception as e:
+            log.info("  inventory error for %s: %s", d, e)
+
+    hs = _find_headless_shell()
+    ch = _find_chromium_exe()
+    log.info("headless_shell=%s", str(hs) if hs else None)
+    log.info("chromium_exe=%s", str(ch) if ch else None)
+    log.info("=======================================")
+
+
+def playwright_browsers_present() -> bool:
+    # Для твоего кейса критично наличие headless_shell
+    return _find_headless_shell() is not None
+
+
 # ───────────────────────── УСТАНОВКА BROWSERS ─────────────────────────
-# ВАЖНО: РОВНО КАК В КОДЕ 1 (без deps, без su, без --with-deps)
+# ВАЖНО: команда установки — РОВНО как в коде 1.
 
 def ensure_playwright_browsers() -> None:
     """
@@ -74,7 +208,7 @@ def ensure_playwright_browsers() -> None:
     - никаких su / --with-deps
     """
     try:
-        log.info("Ensuring Playwright Chromium is installed ...")
+        logging.info("Ensuring Playwright Chromium is installed ...")
         result = subprocess.run(
             ["playwright", "install", "chromium", "chromium-headless-shell"],
             check=False,
@@ -82,21 +216,57 @@ def ensure_playwright_browsers() -> None:
             text=True,
         )
         if result.returncode == 0:
-            log.info("Playwright Chromium is installed (or already present).")
+            logging.info("Playwright Chromium is installed (or already present).")
         else:
-            log.error(
+            logging.error(
                 "playwright install returned code %s\nSTDOUT:\n%s\nSTDERR:\n%s",
                 result.returncode,
                 result.stdout,
                 result.stderr,
             )
     except FileNotFoundError:
-        log.error(
+        logging.error(
             "playwright CLI not found in PATH. "
             "Убедись, что Playwright установлен (pip) и доступен как 'playwright'."
         )
     except Exception as e:
-        log.error("Unexpected error while installing Playwright browsers: %s", e)
+        logging.error("Unexpected error while installing Playwright browsers: %s", e)
+
+
+def ensure_playwright_browsers_with_diagnostics(max_attempts: int = 4) -> None:
+    """
+    Логика:
+    - если браузеры уже есть -> ничего не делаем
+    - иначе пытаемся установить (команда ровно как в коде 1)
+    - после каждой попытки проверяем, появился ли headless_shell
+    """
+    if playwright_browsers_present():
+        log.info("Playwright browsers already present. Skipping install.")
+        return
+
+    log.warning("Playwright browsers missing. Will attempt install up to %d times.", max_attempts)
+    for attempt in range(1, max_attempts + 1):
+        log_browser_inventory()
+        ensure_playwright_browsers()
+        # небольшая пауза на запись файлов
+        time.sleep(1.0)
+
+        if playwright_browsers_present():
+            log.info("Browsers became available after attempt %d/%d.", attempt, max_attempts)
+            log_browser_inventory()
+            return
+
+        backoff = min(60.0, 2.0 * (2 ** (attempt - 1)))
+        log.error("Browsers still missing after attempt %d/%d. Backoff %.1fs.", attempt, max_attempts, backoff)
+        time.sleep(backoff)
+
+    # Если дошли сюда — сеть/скачивание стабильно ломаются
+    log_browser_inventory()
+    raise RuntimeError(
+        "Playwright browsers still missing after retries. "
+        "The install command fails to download Chromium (connection closed). "
+        "Fix is to run 'playwright install chromium chromium-headless-shell' in Render BUILD step and/or cache ms-playwright."
+    )
 
 
 def _is_missing_browser_error(e: Exception) -> bool:
@@ -118,7 +288,6 @@ def normalize_decimal(text: str) -> Optional[Decimal]:
         return None
 
     t = t.replace(" ", "")
-    # если и запятая и точка — часто запятая это разделитель тысяч
     if "," in t and "." in t:
         t = t.replace(",", "")
     else:
@@ -342,10 +511,6 @@ async def wait_trades_visible(panel: Locator, timeout_ms: int = 25_000) -> None:
 
 
 async def extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str, Any]]:
-    """
-    Возвращает список dict, готовых для вставки в БД:
-      {source, symbol, price, volume_usdt, volume_rub, trade_time}
-    """
     handle = await panel.element_handle()
     if handle is None:
         raise RuntimeError("Cannot get element_handle(panel).")
@@ -498,8 +663,11 @@ async def scrape_window(page: Page) -> List[Dict[str, Any]]:
 # ───────────────────────── WORKER LOOP ─────────────────────────
 
 async def worker() -> None:
-    # 1) Сначала — установка браузеров (РОВНО как в коде 1)
-    ensure_playwright_browsers()
+    log_env_snapshot()
+
+    # 1) ВАЖНО: установка браузеров — той же командой, что в коде 1
+    #    + диагностика и ретраи только при фактическом отсутствии бинарника.
+    ensure_playwright_browsers_with_diagnostics(max_attempts=4)
 
     seen: Set[TradeKey] = set()
     seen_q: Deque[TradeKey] = deque()
@@ -521,9 +689,11 @@ async def worker() -> None:
                     try:
                         browser, context, page = await open_browser(pw)
                     except Exception as e:
-                        # если браузеров нет — ставим РОВНО тем же способом и пробуем снова
+                        # Если браузер не найден — печатаем инвентарь и пробуем ещё раз поставить
                         if _is_missing_browser_error(e):
-                            ensure_playwright_browsers()
+                            log.error("Missing browser error caught: %s", e)
+                            log_browser_inventory()
+                            ensure_playwright_browsers_with_diagnostics(max_attempts=4)
                             browser, context, page = await open_browser(pw)
                         else:
                             raise
@@ -580,27 +750,21 @@ async def worker() -> None:
                         seen.discard(old)
 
                 if new_rows:
-                    log.info(
-                        "Parsed %d new trades. Newest: %s",
-                        len(new_rows),
-                        json.dumps(new_rows[-1], ensure_ascii=False),
-                    )
+                    log.info("Parsed %d new trades. Newest: %s",
+                             len(new_rows),
+                             json.dumps(new_rows[-1], ensure_ascii=False))
                     await supabase_upsert(new_rows)
 
                 sleep_s = max(0.35, POLL_SECONDS + random.uniform(-0.15, 0.15))
                 await asyncio.sleep(sleep_s)
 
             except asyncio.TimeoutError:
-                log.error(
-                    "Timeout: scrape exceeded %.1fs. Restarting browser session...",
-                    SCRAPE_TIMEOUT_SECONDS,
-                )
+                log.error("Timeout: scrape exceeded %.1fs. Restarting browser session...", SCRAPE_TIMEOUT_SECONDS)
                 await safe_close(browser, context, page)
                 browser = context = page = None
 
             except Exception as e:
                 log.error("Worker error: %s", e)
-
                 log.info("Retrying after %.1fs ...", backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(60.0, backoff * 2)
