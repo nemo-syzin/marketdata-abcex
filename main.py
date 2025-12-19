@@ -84,9 +84,6 @@ def q8_str(x: Decimal) -> str:
 
 # ───────────────────────── PLAYWRIGHT INSTALL (как в rapira) ─────────────────────────
 
-_last_install_ok_ts = 0.0
-_last_install_attempt_ts = 0.0
-
 def _should_force_install(err: Exception) -> bool:
     s = str(err)
     return (
@@ -97,60 +94,47 @@ def _should_force_install(err: Exception) -> bool:
     )
 
 
-def _playwright_install(max_attempts: int = 3) -> bool:
+def ensure_playwright_browsers(
+    browsers: tuple[str, ...] = ("chromium", "chromium-headless-shell"),
+) -> None:
     """
-    Runtime-установка браузеров.
-    Ключевое отличие от вашей текущей версии:
-    - cooldown только после УСПЕХА
-    - после неуспеха даём короткий повтор
+    Гарантируем, что браузеры Playwright скачаны.
+
+    ВАЖНО:
+    - только download (без системных deps)
+    - никаких su / --with-deps
+    - использует Playwright CLI: `playwright install ...`
+
+    browsers: какие браузеры/каналы ставить (по умолчанию chromium + headless-shell)
     """
-    global _last_install_ok_ts, _last_install_attempt_ts
+    try:
+        logging.info("Ensuring Playwright browsers are installed: %s ...", ", ".join(browsers))
 
-    now = time.time()
+        result = subprocess.run(
+            ["playwright", "install", *browsers],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
-    # cooldown после успешной установки (10 минут)
-    if now - _last_install_ok_ts < 600:
-        log.warning("Playwright already installed recently; skipping (success cooldown).")
-        return True
+        if result.returncode == 0:
+            logging.info("Playwright browsers installed (or already present).")
+            return
 
-    # защитимся от слишком частых попыток (после фейла тоже, но коротко)
-    if now - _last_install_attempt_ts < 15:
-        log.warning("Playwright install attempted very recently; skipping (short attempt cooldown).")
-        return False
+        logging.error(
+            "playwright install returned code %s\nSTDOUT:\n%s\nSTDERR:\n%s",
+            result.returncode,
+            result.stdout,
+            result.stderr,
+        )
 
-    _last_install_attempt_ts = now
-
-    env = dict(os.environ)
-    # часто помогает при “server closed connection” (увеличиваем таймаут скачивания)
-    env.setdefault("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", "600000")  # ms
-
-    for attempt in range(1, max_attempts + 1):
-        log.warning("Ensuring Playwright browser: python -m playwright install chromium-headless-shell (attempt %d/%d)", attempt, max_attempts)
-        try:
-            r = subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-            if r.returncode == 0:
-                log.info("Playwright browsers installed.")
-                _last_install_ok_ts = time.time()
-                return True
-
-            log.warning(
-                "Playwright install failed: python -m playwright install chromium chromium-headless-shell\n"
-                "code=%s\nSTDOUT:\n%s\nSTDERR:\n%s",
-                r.returncode, r.stdout, r.stderr
-            )
-        except Exception as e:
-            log.error("Cannot run playwright install: %s", e)
-
-        # небольшой backoff между попытками
-        time.sleep(min(10, 2 * attempt))
-
-    return False
+    except FileNotFoundError:
+        logging.error(
+            "playwright CLI not found in PATH. "
+            "Убедись, что Playwright установлен и доступен как команда 'playwright'."
+        )
+    except Exception as e:
+        logging.error("Unexpected error while installing Playwright browsers: %s", e)
 
 
 # ───────────────────────── SUPABASE ─────────────────────────
@@ -506,9 +490,7 @@ async def worker() -> None:
                         browser, context, page = await open_browser(pw)
                     except Exception as e:
                         if (not SKIP_BROWSER_INSTALL) and _should_force_install(e):
-                            ok = _playwright_install(max_attempts=3)
-                            if not ok:
-                                raise
+                            ensure_playwright_browsers(("chromium", "chromium-headless-shell"))
                             browser, context, page = await open_browser(pw)
                         else:
                             raise
@@ -570,7 +552,7 @@ async def worker() -> None:
                 log.error("Worker error: %s", e)
 
                 if (not SKIP_BROWSER_INSTALL) and _should_force_install(e):
-                    _playwright_install(max_attempts=3)
+                    ensure_playwright_browsers(("chromium", "chromium-headless-shell"))
 
                 log.info("Retrying after %.1fs ...", backoff)
                 await asyncio.sleep(backoff)
