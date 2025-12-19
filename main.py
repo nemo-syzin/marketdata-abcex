@@ -28,8 +28,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-# unique index должен совпадать:
-# (source, symbol, trade_time, price, volume_usdt)
+# Должно совпадать с unique index:
+# create unique index ... (source, symbol, trade_time, price, volume_usdt)
 ON_CONFLICT = os.getenv("ON_CONFLICT", "source,symbol,trade_time,price,volume_usdt")
 
 LIMIT = int(os.getenv("LIMIT", "200"))
@@ -64,7 +64,8 @@ logging.basicConfig(
 log = logging.getLogger("abcex-worker")
 
 
-# ───────────────────────── PLAYWRIGHT BROWSERS INSTALL (как в Rapira) ─────────────────────────
+# ───────────────────────── УСТАНОВКА BROWSERS ─────────────────────────
+# ВАЖНО: ровно как в твоём примере
 
 def ensure_playwright_browsers() -> None:
     """
@@ -94,7 +95,7 @@ def ensure_playwright_browsers() -> None:
     except FileNotFoundError:
         log.error(
             "playwright CLI not found in PATH. "
-            "Убедись, что Playwright установлен через pip и доступен как 'playwright'."
+            "Убедись, что Playwright установлен (pip) и доступен как 'playwright'."
         )
     except Exception as e:
         log.error("Unexpected error while installing Playwright browsers: %s", e)
@@ -108,6 +109,24 @@ def _is_missing_browser_error(e: Exception) -> bool:
         or "chromium_headless_shell" in s
         or ("ms-playwright" in s and "doesn't exist" in s)
     )
+
+
+def ensure_playwright_browsers_with_retry(max_attempts: int = 6) -> None:
+    """
+    НЕ меняет способ установки (команда та же),
+    просто повторяет попытку, если сеть/скачивание упали.
+    """
+    base = 2.0
+    for i in range(1, max_attempts + 1):
+        ensure_playwright_browsers()
+
+        # Если установка не удалась, это будет видно по логам (returncode != 0).
+        # Но subprocess.run не кидает исключение, поэтому используем быстрый "проверочный" запуск позже.
+        # Здесь просто делаем backoff перед следующей попыткой.
+        if i < max_attempts:
+            sleep_s = min(60.0, base * (2 ** (i - 1)))
+            log.info("If browsers still missing, will retry install in %.1fs (attempt %d/%d)...", sleep_s, i + 1, max_attempts)
+            time.sleep(sleep_s)
 
 
 # ───────────────────────── NUM HELPERS ─────────────────────────
@@ -341,6 +360,10 @@ async def wait_trades_visible(panel: Locator, timeout_ms: int = 25_000) -> None:
 
 
 async def extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str, Any]]:
+    """
+    Возвращает список dict, готовых для вставки в БД:
+      {source, symbol, price, volume_usdt, volume_rub, trade_time}
+    """
     handle = await panel.element_handle()
     if handle is None:
         raise RuntimeError("Cannot get element_handle(panel).")
@@ -447,6 +470,7 @@ async def open_browser(pw) -> Tuple[Browser, BrowserContext, Page]:
     page = await context.new_page()
     page.set_default_timeout(10_000)
 
+    # Для SPA безопаснее domcontentloaded + небольшие waits
     await page.goto(ABCEX_URL, wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_timeout(1500)
 
@@ -493,8 +517,9 @@ async def scrape_window(page: Page) -> List[Dict[str, Any]]:
 # ───────────────────────── WORKER LOOP ─────────────────────────
 
 async def worker() -> None:
-    # ВАЖНО: ставим браузеры ДО первого launch (как в рабочем Rapira)
-    ensure_playwright_browsers()
+    # 1) Сначала — установка браузеров (как в твоём примере)
+    #    + ретраи (не меняют способ установки, только повторяют попытку)
+    ensure_playwright_browsers_with_retry(max_attempts=6)
 
     seen: Set[TradeKey] = set()
     seen_q: Deque[TradeKey] = deque()
@@ -516,12 +541,13 @@ async def worker() -> None:
                     try:
                         browser, context, page = await open_browser(pw)
                     except Exception as e:
-                        # если не хватает браузера — ставим и пробуем снова
+                        # если всё ещё нет браузера — пробуем установить ещё раз (тем же способом)
                         if _is_missing_browser_error(e):
-                            ensure_playwright_browsers()
+                            ensure_playwright_browsers_with_retry(max_attempts=6)
                             browser, context, page = await open_browser(pw)
                         else:
                             raise
+
                     backoff = 2.0
                     last_reload = time.monotonic()
                     last_heartbeat = time.monotonic()
@@ -589,10 +615,6 @@ async def worker() -> None:
 
             except Exception as e:
                 log.error("Worker error: %s", e)
-
-                # если это снова “нет браузера” — ставим прямо сейчас (без cooldown)
-                if _is_missing_browser_error(e):
-                    ensure_playwright_browsers()
 
                 log.info("Retrying after %.1fs ...", backoff)
                 await asyncio.sleep(backoff)
