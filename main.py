@@ -11,7 +11,6 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 import glob
@@ -42,7 +41,7 @@ WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "25000"))
 
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}:\d{2})\b")
 
-# ВАЖНО: фиксируем путь браузеров (как в логе Render)
+# фиксируем кэш браузеров для Render
 BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
 
@@ -57,13 +56,12 @@ logger = logging.getLogger("abcex-worker")
 # ───────────────────────── INSTALL HELPERS ─────────────────────────
 
 def _env_without_proxies() -> Dict[str, str]:
-    """
-    Для playwright install убираем прокси, чтобы скачивание браузеров не ломалось.
-    """
     env = dict(os.environ)
-    for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]:
+    for k in [
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    ]:
         env.pop(k, None)
-    # путь браузеров сохраняем
     env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
     return env
 
@@ -80,42 +78,31 @@ def _chromium_exists() -> bool:
 
 def _playwright_install() -> None:
     """
-    Runtime-установка браузеров РОВНО как в вашем примере:
+    РОВНО как в твоём примере:
       python -m playwright install chromium chromium-headless-shell
-
-    Запускаем БЕЗ прокси (env_without_proxies), чтобы не ломалось скачивание.
-    Всегда печатаем stdout/stderr, чтобы видеть реальную причину, если не скачивает.
+    ВАЖНО: запускаем БЕЗ прокси, иначе CDN загрузка часто рвётся.
     """
     logger.warning("Installing Playwright browsers (runtime) to %s ...", BROWSERS_ROOT)
 
-    try:
-        r = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
-            check=False,
-            capture_output=True,
-            text=True,
-            env=_env_without_proxies(),
-            timeout=15 * 60,
-        )
+    r = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_env_without_proxies(),
+        timeout=15 * 60,
+    )
 
-        logger.warning("playwright install returncode=%s", r.returncode)
-        if r.stdout:
-            logger.warning("playwright install STDOUT:\n%s", r.stdout[-4000:])
-        if r.stderr:
-            logger.warning("playwright install STDERR:\n%s", r.stderr[-4000:])
+    logger.warning("playwright install returncode=%s", r.returncode)
+    if r.stdout:
+        logger.warning("playwright install STDOUT:\n%s", r.stdout[-4000:])
+    if r.stderr:
+        logger.warning("playwright install STDERR:\n%s", r.stderr[-4000:])
 
-        if r.returncode != 0:
-            raise RuntimeError("playwright install failed")
+    if r.returncode != 0:
+        raise RuntimeError("playwright install failed")
 
-        # верификация наличия файлов
-        hs_ok = _headless_shell_exists()
-        ch_ok = _chromium_exists()
-        logger.warning("Install verification: chromium=%s headless_shell=%s", ch_ok, hs_ok)
-
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("playwright install timeout (15m)")
-    except Exception as e:
-        raise RuntimeError(f"Cannot run playwright install: {e}")
+    logger.warning("Install verification: chromium=%s headless_shell=%s", _chromium_exists(), _headless_shell_exists())
 
 
 def _should_install(err: Exception) -> bool:
@@ -145,20 +132,58 @@ def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
         out["password"] = u.password
     return out
 
-# ───────────────────────── DEBUG ─────────────────────────
+# ───────────────────────── DEBUG / DIAGNOSTICS ─────────────────────────
 
-async def save_debug(page: Page, tag: str) -> None:
+async def dump_inputs(page: Page, tag: str) -> None:
     try:
-        png_path = f"abcex_{tag}.png"
-        html_path = f"abcex_{tag}.html"
-        await page.screenshot(path=png_path, full_page=True)
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(await page.content())
-        logger.info("Saved debug: %s, %s", png_path, html_path)
-    except Exception as e:
-        logger.warning("Could not save debug artifacts: %s", e)
+        title = await page.title()
+        url = page.url
+        logger.warning("DIAG[%s] url=%s title=%s", tag, url, title)
 
-# ───────────────────────── PAGE ACTIONS ─────────────────────────
+        data = await page.evaluate(
+            """() => {
+              const els = Array.from(document.querySelectorAll('input, button, a')).slice(0, 300);
+              const out = [];
+              for (const el of els) {
+                const r = el.getBoundingClientRect();
+                const visible = !!(r.width && r.height) && getComputedStyle(el).visibility !== 'hidden';
+                const tag = el.tagName.toLowerCase();
+                const obj = { tag, visible };
+                if (tag === 'input') {
+                  obj.type = el.getAttribute('type') || '';
+                  obj.name = el.getAttribute('name') || '';
+                  obj.id = el.getAttribute('id') || '';
+                  obj.placeholder = el.getAttribute('placeholder') || '';
+                  obj.autocomplete = el.getAttribute('autocomplete') || '';
+                } else {
+                  obj.text = (el.textContent || '').trim().slice(0, 60);
+                  obj.role = el.getAttribute('role') || '';
+                }
+                out.push(obj);
+              }
+              return out;
+            }"""
+        )
+
+        # печатаем компактно
+        for row in data[:120]:
+            if row.get("tag") == "input":
+                logger.warning(
+                    "DIAG[%s] input vis=%s type=%s name=%s id=%s ph=%s ac=%s",
+                    tag, row.get("visible"),
+                    row.get("type"), row.get("name"), row.get("id"),
+                    row.get("placeholder"), row.get("autocomplete"),
+                )
+            else:
+                txt = row.get("text")
+                if txt:
+                    logger.warning(
+                        "DIAG[%s] %s vis=%s role=%s text=%s",
+                        tag, row.get("tag"), row.get("visible"), row.get("role"), txt,
+                    )
+    except Exception as e:
+        logger.warning("DIAG dump failed: %s", e)
+
 
 async def accept_cookies_if_any(page: Page) -> None:
     for label in ["Я согласен", "Принять", "Accept", "I agree", "Согласен"]:
@@ -172,74 +197,119 @@ async def accept_cookies_if_any(page: Page) -> None:
         except Exception:
             pass
 
+# ───────────────────────── LOGIN (robust for Render) ─────────────────────────
+
+async def _find_visible_in_frames(page: Page, selectors: List[str]) -> Optional[Locator]:
+    # ищем и в main frame, и во всех iframe
+    frames = page.frames
+    for fr in frames:
+        for sel in selectors:
+            try:
+                loc = fr.locator(sel)
+                cnt = await loc.count()
+                if cnt <= 0:
+                    continue
+                # ищем первый видимый
+                for i in range(min(cnt, 8)):
+                    cand = loc.nth(i)
+                    if await cand.is_visible():
+                        return cand
+            except Exception:
+                continue
+    return None
+
 
 async def _is_login_visible(page: Page) -> bool:
-    try:
-        pw = page.locator("input[type='password']")
-        return (await pw.count() > 0) and (await pw.first.is_visible())
-    except Exception:
-        return False
+    pw = await _find_visible_in_frames(page, [
+        "input[type='password']",
+        "input[autocomplete='current-password']",
+        "input[name*='pass' i]",
+    ])
+    return pw is not None
+
+
+async def _open_login_modal_if_needed(page: Page) -> None:
+    """
+    На многих сборках ABCEX форма появляется только после клика "Войти".
+    """
+    if await _is_login_visible(page):
+        return
+
+    candidates = [
+        "text=Войти",
+        "text=Login",
+        "text=Sign in",
+        "a:has-text('Войти')",
+        "button:has-text('Войти')",
+        "button:has-text('Login')",
+        "button:has-text('Sign in')",
+    ]
+    for sel in candidates:
+        try:
+            btn = page.locator(sel)
+            if await btn.count() > 0 and await btn.first.is_visible():
+                await btn.first.click(timeout=7_000)
+                await page.wait_for_timeout(600)
+                break
+        except Exception:
+            pass
 
 
 async def login_if_needed(page: Page, email: str, password: str) -> None:
+    await _open_login_modal_if_needed(page)
+
     if not await _is_login_visible(page):
-        logger.info("Login not required (already in session).")
+        logger.info("Login not required (no password field detected).")
         return
 
     logger.info("Login detected. Performing sign-in ...")
 
-    email_candidates = [
+    email_selectors = [
         "input[type='email']",
         "input[name='email']",
+        "input[name*='mail' i]",
         "input[placeholder*='mail' i]",
         "input[placeholder*='email' i]",
         "input[placeholder*='почта' i]",
-        "input[placeholder*='e-mail' i]",
+        "input[autocomplete='username']",
+        "input[type='text'][placeholder*='mail' i]",
+        "input[type='text'][placeholder*='email' i]",
+        "input[type='text'][name*='login' i]",
     ]
-    pw_candidates = [
+    pw_selectors = [
         "input[type='password']",
-        "input[name='password']",
-        "input[placeholder*='пароль' i]",
-        "input[placeholder*='password' i]",
+        "input[autocomplete='current-password']",
+        "input[name*='pass' i]",
     ]
 
-    email_filled = False
-    for sel in email_candidates:
-        loc = page.locator(sel)
-        try:
-            if await loc.count() > 0 and await loc.first.is_visible():
-                await loc.first.fill(email, timeout=10_000)
-                email_filled = True
-                break
-        except Exception:
-            continue
+    email_loc = await _find_visible_in_frames(page, email_selectors)
+    pw_loc = await _find_visible_in_frames(page, pw_selectors)
 
-    pw_filled = False
-    for sel in pw_candidates:
-        loc = page.locator(sel)
-        try:
-            if await loc.count() > 0 and await loc.first.is_visible():
-                await loc.first.fill(password, timeout=10_000)
-                pw_filled = True
-                break
-        except Exception:
-            continue
+    if email_loc is None or pw_loc is None:
+        await dump_inputs(page, "login_fields_not_found")
+        raise RuntimeError("Не смог найти поля email/password (даже с iframe+fallback).")
 
-    if not email_filled or not pw_filled:
-        await save_debug(page, "login_fields_not_found")
-        raise RuntimeError("Не смог найти поля email/password.")
+    # fill
+    await email_loc.fill(email, timeout=10_000)
+    await pw_loc.fill(password, timeout=10_000)
 
-    btn_texts = ["Войти", "Вход", "Sign in", "Login", "Войти в аккаунт"]
+    # submit button best-effort
+    submit_selectors = [
+        "button:has-text('Войти')",
+        "button:has-text('Login')",
+        "button:has-text('Sign in')",
+        "button[type='submit']",
+    ]
     clicked = False
-    for t in btn_texts:
-        try:
-            btn = page.locator(f"button:has-text('{t}')")
-            if await btn.count() > 0 and await btn.first.is_visible():
-                await btn.first.click(timeout=10_000)
+    for sel in submit_selectors:
+        btn = await _find_visible_in_frames(page, [sel])
+        if btn is not None:
+            try:
+                await btn.click(timeout=10_000)
                 clicked = True
                 break
-        except Exception:
-            continue
+            except Exception:
+                pass
 
     if not clicked:
         try:
@@ -247,20 +317,18 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
         except Exception:
             pass
 
-    try:
-        await page.wait_for_timeout(1000)
-        await page.wait_for_load_state("networkidle", timeout=30_000)
-    except Exception:
-        pass
+    # wait: password field disappears
+    await page.wait_for_timeout(800)
+    for _ in range(25):
+        if not await _is_login_visible(page):
+            logger.info("Login successful (password field disappeared).")
+            return
+        await page.wait_for_timeout(400)
 
-    await page.wait_for_timeout(2500)
+    await dump_inputs(page, "login_failed_still_visible")
+    raise RuntimeError("Логин не прошёл (password поле всё ещё видно). Возможны 2FA/капча/антибот.")
 
-    if await _is_login_visible(page):
-        await save_debug(page, "login_failed")
-        raise RuntimeError("Логин не прошёл (форма логина всё ещё видна). Возможны 2FA/капча/иной флоу.")
-
-    logger.info("Login successful.")
-
+# ───────────────────────── TRADES UI ─────────────────────────
 
 async def ensure_last_trades_tab(page: Page) -> None:
     candidates = ["Последние сделки", "Сделки", "История", "Order history", "Trades"]
@@ -289,9 +357,8 @@ async def get_order_history_panel(page: Page) -> Locator:
     panel = page.locator("div[role='tabpanel'][id*='panel-orderHistory']")
     cnt = await panel.count()
     if cnt == 0:
-        await save_debug(page, "no_panel_orderHistory")
+        await dump_inputs(page, "no_panel_orderHistory")
         raise RuntimeError("Не нашёл панель panel-orderHistory.")
-
     for i in range(cnt):
         p = panel.nth(i)
         try:
@@ -299,8 +366,7 @@ async def get_order_history_panel(page: Page) -> Locator:
                 return p
         except Exception:
             continue
-
-    await save_debug(page, "no_visible_panel_orderHistory")
+    await dump_inputs(page, "no_visible_panel_orderHistory")
     raise RuntimeError("panel-orderHistory найдена, но ни одна не видима.")
 
 
@@ -321,7 +387,7 @@ async def wait_trades_visible(page: Page, timeout_ms: int) -> None:
             pass
         await page.wait_for_timeout(600)
 
-    await save_debug(page, "trades_not_visible")
+    await dump_inputs(page, "trades_not_visible")
     raise RuntimeError("Не дождался появления сделок (HH:MM:SS).")
 
 
@@ -352,7 +418,6 @@ def _trade_time_to_iso_moscow(hhmmss: str) -> str:
         dt -= timedelta(days=1)
     return dt.isoformat()
 
-# ───────────────────────── PARSE ─────────────────────────
 
 async def extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str, Any]]:
     handle = await panel.element_handle()
@@ -450,7 +515,6 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
 async def supabase_upsert_trades(trades: List[Dict[str, Any]]) -> None:
     if not trades:
         return
-
     if not SUPABASE_URL or not SUPABASE_KEY or not SUPABASE_TABLE:
         logger.warning("Supabase env is not fully set; skipping DB write.")
         return
@@ -478,7 +542,6 @@ async def run_once() -> List[Dict[str, Any]]:
 
     async with async_playwright() as p:
         browser = None
-
         for attempt in (1, 2):
             try:
                 launch_kwargs: Dict[str, Any] = {
@@ -494,7 +557,6 @@ async def run_once() -> List[Dict[str, Any]]:
 
                 browser = await p.chromium.launch(**launch_kwargs)
                 break
-
             except Exception as e:
                 if _should_install(e):
                     logger.warning("Chromium launch failed (missing executable). Installing and retry... attempt=%s", attempt)
@@ -531,12 +593,12 @@ async def run_once() -> List[Dict[str, Any]]:
 
             await accept_cookies_if_any(page)
 
-            if await _is_login_visible(page):
-                if not ABCEX_EMAIL or not ABCEX_PASSWORD:
-                    await save_debug(page, "need_credentials")
-                    raise RuntimeError("Нужен логин, но ABCEX_EMAIL/ABCEX_PASSWORD не заданы в env.")
-                await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
+            # ЛОГИН
+            if not ABCEX_EMAIL or not ABCEX_PASSWORD:
+                raise RuntimeError("ABCEX_EMAIL/ABCEX_PASSWORD must be set in env.")
+            await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
 
+            # сохраняем session state
             try:
                 await context.storage_state(path=STATE_PATH)
                 logger.info("Saved session state to %s", STATE_PATH)
@@ -550,7 +612,7 @@ async def run_once() -> List[Dict[str, Any]]:
             trades = await extract_trades_from_panel(panel, limit=LIMIT)
 
             if not trades:
-                await save_debug(page, "no_trades_parsed")
+                await dump_inputs(page, "no_trades_parsed")
                 logger.warning("No trades parsed this cycle.")
                 return []
 
@@ -558,7 +620,7 @@ async def run_once() -> List[Dict[str, Any]]:
             return trades
 
         except PWTimeoutError:
-            await save_debug(page, "timeout")
+            await dump_inputs(page, "timeout")
             raise
         finally:
             try:
@@ -577,12 +639,10 @@ async def run_once() -> List[Dict[str, Any]]:
 # ───────────────────────── MAIN LOOP ─────────────────────────
 
 async def main() -> None:
-    # 1) Если браузеров нет — ставим сразу (без прокси)
-    if not _headless_shell_exists() or not _chromium_exists():
+    if not _chromium_exists() or not _headless_shell_exists():
         logger.warning("Browsers not found. Installing now...")
         _playwright_install()
 
-    # 2) Дедуп в памяти
     seen: Dict[TradeKey, float] = {}
     seen_ttl_sec = 60 * 30
 
@@ -613,7 +673,6 @@ async def main() -> None:
             if _should_install(e):
                 logger.warning("Detected missing browser executable. Re-installing...")
                 _playwright_install()
-
             await asyncio.sleep(3.0)
 
         await asyncio.sleep(POLL_SEC)
