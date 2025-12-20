@@ -41,7 +41,7 @@ WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "25000"))
 
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}:\d{2})\b")
 
-# фиксируем кэш браузеров для Render
+# Render cache path
 BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
 
@@ -56,6 +56,9 @@ logger = logging.getLogger("abcex-worker")
 # ───────────────────────── INSTALL HELPERS ─────────────────────────
 
 def _env_without_proxies() -> Dict[str, str]:
+    """
+    На playwright install убираем прокси, иначе CDN скачивание часто рвётся.
+    """
     env = dict(os.environ)
     for k in [
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
@@ -78,9 +81,8 @@ def _chromium_exists() -> bool:
 
 def _playwright_install() -> None:
     """
-    РОВНО как в твоём примере:
+    Установка браузеров ровно как в твоём примере:
       python -m playwright install chromium chromium-headless-shell
-    ВАЖНО: запускаем БЕЗ прокси, иначе CDN загрузка часто рвётся.
     """
     logger.warning("Installing Playwright browsers (runtime) to %s ...", BROWSERS_ROOT)
 
@@ -102,7 +104,11 @@ def _playwright_install() -> None:
     if r.returncode != 0:
         raise RuntimeError("playwright install failed")
 
-    logger.warning("Install verification: chromium=%s headless_shell=%s", _chromium_exists(), _headless_shell_exists())
+    logger.warning(
+        "Install verification: chromium=%s headless_shell=%s",
+        _chromium_exists(),
+        _headless_shell_exists(),
+    )
 
 
 def _should_install(err: Exception) -> bool:
@@ -132,58 +138,7 @@ def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
         out["password"] = u.password
     return out
 
-# ───────────────────────── DEBUG / DIAGNOSTICS ─────────────────────────
-
-async def dump_inputs(page: Page, tag: str) -> None:
-    try:
-        title = await page.title()
-        url = page.url
-        logger.warning("DIAG[%s] url=%s title=%s", tag, url, title)
-
-        data = await page.evaluate(
-            """() => {
-              const els = Array.from(document.querySelectorAll('input, button, a')).slice(0, 300);
-              const out = [];
-              for (const el of els) {
-                const r = el.getBoundingClientRect();
-                const visible = !!(r.width && r.height) && getComputedStyle(el).visibility !== 'hidden';
-                const tag = el.tagName.toLowerCase();
-                const obj = { tag, visible };
-                if (tag === 'input') {
-                  obj.type = el.getAttribute('type') || '';
-                  obj.name = el.getAttribute('name') || '';
-                  obj.id = el.getAttribute('id') || '';
-                  obj.placeholder = el.getAttribute('placeholder') || '';
-                  obj.autocomplete = el.getAttribute('autocomplete') || '';
-                } else {
-                  obj.text = (el.textContent || '').trim().slice(0, 60);
-                  obj.role = el.getAttribute('role') || '';
-                }
-                out.push(obj);
-              }
-              return out;
-            }"""
-        )
-
-        # печатаем компактно
-        for row in data[:120]:
-            if row.get("tag") == "input":
-                logger.warning(
-                    "DIAG[%s] input vis=%s type=%s name=%s id=%s ph=%s ac=%s",
-                    tag, row.get("visible"),
-                    row.get("type"), row.get("name"), row.get("id"),
-                    row.get("placeholder"), row.get("autocomplete"),
-                )
-            else:
-                txt = row.get("text")
-                if txt:
-                    logger.warning(
-                        "DIAG[%s] %s vis=%s role=%s text=%s",
-                        tag, row.get("tag"), row.get("visible"), row.get("role"), txt,
-                    )
-    except Exception as e:
-        logger.warning("DIAG dump failed: %s", e)
-
+# ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
     for label in ["Я согласен", "Принять", "Accept", "I agree", "Согласен"]:
@@ -197,19 +152,15 @@ async def accept_cookies_if_any(page: Page) -> None:
         except Exception:
             pass
 
-# ───────────────────────── LOGIN (robust for Render) ─────────────────────────
 
 async def _find_visible_in_frames(page: Page, selectors: List[str]) -> Optional[Locator]:
-    # ищем и в main frame, и во всех iframe
-    frames = page.frames
-    for fr in frames:
+    for fr in page.frames:
         for sel in selectors:
             try:
                 loc = fr.locator(sel)
                 cnt = await loc.count()
                 if cnt <= 0:
                     continue
-                # ищем первый видимый
                 for i in range(min(cnt, 8)):
                     cand = loc.nth(i)
                     if await cand.is_visible():
@@ -229,20 +180,13 @@ async def _is_login_visible(page: Page) -> bool:
 
 
 async def _open_login_modal_if_needed(page: Page) -> None:
-    """
-    На многих сборках ABCEX форма появляется только после клика "Войти".
-    """
     if await _is_login_visible(page):
         return
 
     candidates = [
-        "text=Войти",
-        "text=Login",
-        "text=Sign in",
-        "a:has-text('Войти')",
-        "button:has-text('Войти')",
-        "button:has-text('Login')",
-        "button:has-text('Sign in')",
+        "text=Войти", "text=Login", "text=Sign in",
+        "a:has-text('Войти')", "button:has-text('Войти')",
+        "button:has-text('Login')", "button:has-text('Sign in')",
     ]
     for sel in candidates:
         try:
@@ -286,14 +230,11 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
     pw_loc = await _find_visible_in_frames(page, pw_selectors)
 
     if email_loc is None or pw_loc is None:
-        await dump_inputs(page, "login_fields_not_found")
-        raise RuntimeError("Не смог найти поля email/password (даже с iframe+fallback).")
+        raise RuntimeError("Не смог найти поля email/password.")
 
-    # fill
     await email_loc.fill(email, timeout=10_000)
     await pw_loc.fill(password, timeout=10_000)
 
-    # submit button best-effort
     submit_selectors = [
         "button:has-text('Войти')",
         "button:has-text('Login')",
@@ -317,18 +258,16 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
         except Exception:
             pass
 
-    # wait: password field disappears
     await page.wait_for_timeout(800)
-    for _ in range(25):
+    for _ in range(30):
         if not await _is_login_visible(page):
             logger.info("Login successful (password field disappeared).")
             return
         await page.wait_for_timeout(400)
 
-    await dump_inputs(page, "login_failed_still_visible")
     raise RuntimeError("Логин не прошёл (password поле всё ещё видно). Возможны 2FA/капча/антибот.")
 
-# ───────────────────────── TRADES UI ─────────────────────────
+# ───────────────────────── TRADES / PARSING ─────────────────────────
 
 async def ensure_last_trades_tab(page: Page) -> None:
     candidates = ["Последние сделки", "Сделки", "История", "Order history", "Trades"]
@@ -353,23 +292,6 @@ async def ensure_last_trades_tab(page: Page) -> None:
             pass
 
 
-async def get_order_history_panel(page: Page) -> Locator:
-    panel = page.locator("div[role='tabpanel'][id*='panel-orderHistory']")
-    cnt = await panel.count()
-    if cnt == 0:
-        await dump_inputs(page, "no_panel_orderHistory")
-        raise RuntimeError("Не нашёл панель panel-orderHistory.")
-    for i in range(cnt):
-        p = panel.nth(i)
-        try:
-            if await p.is_visible():
-                return p
-        except Exception:
-            continue
-    await dump_inputs(page, "no_visible_panel_orderHistory")
-    raise RuntimeError("panel-orderHistory найдена, но ни одна не видима.")
-
-
 async def wait_trades_visible(page: Page, timeout_ms: int) -> None:
     start = time.time()
     while (time.time() - start) * 1000 < timeout_ms:
@@ -386,8 +308,6 @@ async def wait_trades_visible(page: Page, timeout_ms: int) -> None:
         except Exception:
             pass
         await page.wait_for_timeout(600)
-
-    await dump_inputs(page, "trades_not_visible")
     raise RuntimeError("Не дождался появления сделок (HH:MM:SS).")
 
 
@@ -419,10 +339,31 @@ def _trade_time_to_iso_moscow(hhmmss: str) -> str:
     return dt.isoformat()
 
 
+async def get_order_history_panel(page: Page) -> Optional[Locator]:
+    """
+    В некоторых UI этого элемента нет. Тогда вернём None и уйдём в fallback.
+    """
+    try:
+        panel = page.locator("div[role='tabpanel'][id*='panel-orderHistory']")
+        if await panel.count() <= 0:
+            return None
+        # видимая
+        for i in range(await panel.count()):
+            p = panel.nth(i)
+            try:
+                if await p.is_visible():
+                    return p
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
 async def extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str, Any]]:
     handle = await panel.element_handle()
     if handle is None:
-        raise RuntimeError("Не смог получить element_handle панели.")
+        return []
 
     raw_rows: List[Dict[str, Any]] = await handle.evaluate(
         """(root, limit) => {
@@ -456,6 +397,50 @@ async def extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str
         limit,
     )
 
+    return _rows_to_trades(raw_rows)
+
+
+async def extract_trades_fallback_from_document(page: Page, limit: int) -> List[Dict[str, Any]]:
+    """
+    Фоллбек: ищем сделки по ВСЕМУ документу (без panel-orderHistory).
+    Это спасает, когда UI другой.
+    """
+    raw_rows: List[Dict[str, Any]] = await page.evaluate(
+        """(limit) => {
+          const isTime = (s) => /^\\d{2}:\\d{2}:\\d{2}$/.test((s||'').trim());
+          const isNum  = (s) => /^[0-9][0-9\\s\\u00A0.,]*$/.test((s||'').trim());
+
+          const out = [];
+          const divs = Array.from(document.querySelectorAll('div'));
+
+          for (const g of divs) {
+            const ps = Array.from(g.querySelectorAll(':scope > p'));
+            if (ps.length < 3) continue;
+
+            const p0 = (ps[0].textContent || '').trim();
+            const p1 = (ps[1].textContent || '').trim();
+            const p2 = (ps[2].textContent || '').trim();
+
+            if (!isTime(p2)) continue;
+            if (!isNum(p0) || !isNum(p1)) continue;
+
+            const style0 = (ps[0].getAttribute('style') || '').toLowerCase();
+            let side = null;
+            if (style0.includes('green')) side = 'buy';
+            if (style0.includes('red')) side = 'sell';
+
+            out.push({ price_raw: p0, qty_raw: p1, time: p2, side });
+            if (out.length >= limit) break;
+          }
+          return out;
+        }""",
+        limit,
+    )
+
+    return _rows_to_trades(raw_rows)
+
+
+def _rows_to_trades(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     trades: List[Dict[str, Any]] = []
     for r in raw_rows:
         try:
@@ -488,7 +473,6 @@ async def extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str
             )
         except Exception:
             continue
-
     return trades
 
 # ───────────────────────── SUPABASE ─────────────────────────
@@ -593,12 +577,10 @@ async def run_once() -> List[Dict[str, Any]]:
 
             await accept_cookies_if_any(page)
 
-            # ЛОГИН
             if not ABCEX_EMAIL or not ABCEX_PASSWORD:
                 raise RuntimeError("ABCEX_EMAIL/ABCEX_PASSWORD must be set in env.")
             await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
 
-            # сохраняем session state
             try:
                 await context.storage_state(path=STATE_PATH)
                 logger.info("Saved session state to %s", STATE_PATH)
@@ -609,18 +591,19 @@ async def run_once() -> List[Dict[str, Any]]:
             await wait_trades_visible(page, timeout_ms=WAIT_TRADES_TIMEOUT_MS)
 
             panel = await get_order_history_panel(page)
-            trades = await extract_trades_from_panel(panel, limit=LIMIT)
+
+            trades: List[Dict[str, Any]] = []
+            if panel is not None:
+                trades = await extract_trades_from_panel(panel, limit=LIMIT)
 
             if not trades:
-                await dump_inputs(page, "no_trades_parsed")
-                logger.warning("No trades parsed this cycle.")
-                return []
+                logger.warning("panel-orderHistory not found or empty. Using fallback DOM scan...")
+                trades = await extract_trades_fallback_from_document(page, limit=LIMIT)
 
             logger.info("Parsed trades: %d", len(trades))
             return trades
 
         except PWTimeoutError:
-            await dump_inputs(page, "timeout")
             raise
         finally:
             try:
