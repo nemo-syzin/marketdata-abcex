@@ -11,8 +11,10 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
+import glob
 
 import httpx
 from playwright.async_api import async_playwright, Page, Locator, TimeoutError as PWTimeoutError
@@ -40,6 +42,10 @@ WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "25000"))
 
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}:\d{2})\b")
 
+# ВАЖНО: фиксируем путь браузеров (как в логе Render)
+BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
+
 # ───────────────────────── LOGGING ─────────────────────────
 
 logging.basicConfig(
@@ -48,28 +54,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger("abcex-worker")
 
-# ───────────────────────── PLAYWRIGHT INSTALL (как в твоём фрагменте) ─────────────────────────
+# ───────────────────────── INSTALL HELPERS ─────────────────────────
 
-_last_install_ts = 0.0
-
-def _playwright_install(force: bool = False) -> None:
+def _env_without_proxies() -> Dict[str, str]:
     """
-    Runtime-установка браузеров. Команда как в примере:
+    Для playwright install убираем прокси, чтобы скачивание браузеров не ломалось.
+    """
+    env = dict(os.environ)
+    for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]:
+        env.pop(k, None)
+    # путь браузеров сохраняем
+    env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
+    return env
+
+
+def _headless_shell_exists() -> bool:
+    pattern = os.path.join(BROWSERS_ROOT, "chromium_headless_shell-*", "chrome-linux", "headless_shell")
+    return len(glob.glob(pattern)) > 0
+
+
+def _chromium_exists() -> bool:
+    pattern = os.path.join(BROWSERS_ROOT, "chromium-*", "chrome-linux", "chrome")
+    return len(glob.glob(pattern)) > 0
+
+
+def _playwright_install() -> None:
+    """
+    Runtime-установка браузеров РОВНО как в вашем примере:
       python -m playwright install chromium chromium-headless-shell
 
-    ВАЖНО:
-    - cooldown 10 минут действует только если force=False
-    - при force=True (например, "Executable doesn't exist") — ставим всегда
+    Запускаем БЕЗ прокси (env_without_proxies), чтобы не ломалось скачивание.
+    Всегда печатаем stdout/stderr, чтобы видеть реальную причину, если не скачивает.
     """
-    global _last_install_ts
-    now = time.time()
-
-    if not force and now - _last_install_ts < 600:
-        logger.warning("Playwright install was attempted recently; skipping (cooldown).")
-        return
-
-    _last_install_ts = now
-    logger.warning("Installing Playwright browsers (runtime)... force=%s", force)
+    logger.warning("Installing Playwright browsers (runtime) to %s ...", BROWSERS_ROOT)
 
     try:
         r = subprocess.run(
@@ -77,19 +94,31 @@ def _playwright_install(force: bool = False) -> None:
             check=False,
             capture_output=True,
             text=True,
+            env=_env_without_proxies(),
+            timeout=15 * 60,
         )
+
+        logger.warning("playwright install returncode=%s", r.returncode)
+        if r.stdout:
+            logger.warning("playwright install STDOUT:\n%s", r.stdout[-4000:])
+        if r.stderr:
+            logger.warning("playwright install STDERR:\n%s", r.stderr[-4000:])
+
         if r.returncode != 0:
-            logger.error(
-                "playwright install failed (%s)\nSTDOUT:\n%s\nSTDERR:\n%s",
-                r.returncode, r.stdout, r.stderr
-            )
-        else:
-            logger.info("Playwright browsers installed.")
+            raise RuntimeError("playwright install failed")
+
+        # верификация наличия файлов
+        hs_ok = _headless_shell_exists()
+        ch_ok = _chromium_exists()
+        logger.warning("Install verification: chromium=%s headless_shell=%s", ch_ok, hs_ok)
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("playwright install timeout (15m)")
     except Exception as e:
-        logger.error("Cannot run playwright install: %s", e)
+        raise RuntimeError(f"Cannot run playwright install: {e}")
 
 
-def _should_force_install(err: Exception) -> bool:
+def _should_install(err: Exception) -> bool:
     s = str(err)
     return (
         "Executable doesn't exist" in s
@@ -98,20 +127,15 @@ def _should_force_install(err: Exception) -> bool:
         or ("ms-playwright" in s and "doesn't exist" in s)
     )
 
-# ───────────────────────── PROXY HELPERS ─────────────────────────
+# ───────────────────────── PROXY ─────────────────────────
 
 def _get_proxy_url() -> Optional[str]:
     return os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
 
 
 def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
-    """
-    Playwright proxy:
-      {"server": "http://host:port", "username": "...", "password": "..."}
-    """
     u = urlsplit(proxy_url)
     if not u.scheme or not u.hostname or not u.port:
-        # если формат нестандартный — пробуем как есть
         return {"server": proxy_url}
 
     out: Dict[str, Any] = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
@@ -205,7 +229,6 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
         await save_debug(page, "login_fields_not_found")
         raise RuntimeError("Не смог найти поля email/password.")
 
-    # кнопка входа
     btn_texts = ["Войти", "Вход", "Sign in", "Login", "Войти в аккаунт"]
     clicked = False
     for t in btn_texts:
@@ -224,7 +247,6 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
         except Exception:
             pass
 
-    # ждём прогрузку
     try:
         await page.wait_for_timeout(1000)
         await page.wait_for_load_state("networkidle", timeout=30_000)
@@ -241,9 +263,6 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
 
 
 async def ensure_last_trades_tab(page: Page) -> None:
-    """
-    Best-effort: стараемся держаться вкладки со сделками/историей.
-    """
     candidates = ["Последние сделки", "Сделки", "История", "Order history", "Trades"]
     for t in candidates:
         try:
@@ -309,9 +328,9 @@ async def wait_trades_visible(page: Page, timeout_ms: int) -> None:
 def _normalize_num(text: str) -> float:
     t = (text or "").strip().replace("\xa0", " ").replace(" ", "")
     if "," in t and "." in t:
-        t = t.replace(",", "")   # 1,234.56
+        t = t.replace(",", "")
     else:
-        t = t.replace(",", ".")  # 1234,56
+        t = t.replace(",", ".")
     return float(t)
 
 
@@ -326,11 +345,7 @@ def _extract_time(text: str) -> Optional[str]:
 
 
 def _trade_time_to_iso_moscow(hhmmss: str) -> str:
-    """
-    На UI только HH:MM:SS. Привязываем к "сегодня" по Москве.
-    Если получившееся время > текущего времени — считаем, что это было "вчера".
-    """
-    now = datetime.utcnow() + timedelta(hours=3)  # MSK (приближенно)
+    now = datetime.utcnow() + timedelta(hours=3)
     h, m, s = [int(x) for x in hhmmss.split(":")]
     dt = now.replace(hour=h, minute=m, second=s, microsecond=0)
     if dt > now + timedelta(seconds=2):
@@ -455,16 +470,16 @@ async def supabase_upsert_trades(trades: List[Dict[str, Any]]) -> None:
             return
         logger.error("Supabase write failed: %s %s", resp.status_code, resp.text[:1500])
 
-# ───────────────────────── SCRAPE ONCE ─────────────────────────
+# ───────────────────────── RUN ONCE ─────────────────────────
 
 async def run_once() -> List[Dict[str, Any]]:
     proxy_url = _get_proxy_url()
     pw_proxy = _parse_proxy_for_playwright(proxy_url) if proxy_url else None
 
     async with async_playwright() as p:
-        # launch with гарантированным force-install при missing executable
         browser = None
-        for attempt in (1, 2, 3):
+
+        for attempt in (1, 2):
             try:
                 launch_kwargs: Dict[str, Any] = {
                     "headless": True,
@@ -479,10 +494,11 @@ async def run_once() -> List[Dict[str, Any]]:
 
                 browser = await p.chromium.launch(**launch_kwargs)
                 break
+
             except Exception as e:
-                if _should_force_install(e):
-                    logger.warning("Chromium launch failed (missing executable). Forcing install and retry... attempt=%s", attempt)
-                    _playwright_install(force=True)
+                if _should_install(e):
+                    logger.warning("Chromium launch failed (missing executable). Installing and retry... attempt=%s", attempt)
+                    _playwright_install()
                     await asyncio.sleep(2.0)
                     continue
                 raise
@@ -521,7 +537,6 @@ async def run_once() -> List[Dict[str, Any]]:
                     raise RuntimeError("Нужен логин, но ABCEX_EMAIL/ABCEX_PASSWORD не заданы в env.")
                 await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
 
-            # сохраняем session state
             try:
                 await context.storage_state(path=STATE_PATH)
                 logger.info("Saved session state to %s", STATE_PATH)
@@ -562,10 +577,12 @@ async def run_once() -> List[Dict[str, Any]]:
 # ───────────────────────── MAIN LOOP ─────────────────────────
 
 async def main() -> None:
-    # СТРОГО как нужно для Render: ставим браузер runtime (FORCE)
-    _playwright_install(force=True)
+    # 1) Если браузеров нет — ставим сразу (без прокси)
+    if not _headless_shell_exists() or not _chromium_exists():
+        logger.warning("Browsers not found. Installing now...")
+        _playwright_install()
 
-    # in-memory дедуп (чтобы не спамить одинаковыми сделками)
+    # 2) Дедуп в памяти
     seen: Dict[TradeKey, float] = {}
     seen_ttl_sec = 60 * 30
 
@@ -593,10 +610,10 @@ async def main() -> None:
 
         except Exception as e:
             logger.error("Cycle error: %s", e)
-            if _should_force_install(e):
-                _playwright_install(force=True)
+            if _should_install(e):
+                logger.warning("Detected missing browser executable. Re-installing...")
+                _playwright_install()
 
-            # чтобы не уйти в быстрый спин при постоянной проблеме
             await asyncio.sleep(3.0)
 
         await asyncio.sleep(POLL_SEC)
