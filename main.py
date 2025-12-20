@@ -10,24 +10,25 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit
-import glob
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
-from playwright.async_api import async_playwright, Page, Locator
+from playwright.async_api import async_playwright, Page, Locator, TimeoutError as PWTimeoutError
 
 # ───────────────────────── CONFIG ─────────────────────────
 
 ABCEX_URL = os.getenv("ABCEX_URL", "https://abcex.io/client/spot/USDTRUB")
-STATE_PATH = os.getenv("STATE_PATH", "abcex_state.json")
-
 SOURCE = os.getenv("SOURCE", "abcex")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
+STATE_PATH = os.getenv("STATE_PATH", "abcex_state.json")
+DEBUG_DIR = os.getenv("DEBUG_DIR", ".")  # на Render можно оставить "."
+
 LIMIT = int(os.getenv("LIMIT", "200"))
-POLL_SEC = float(os.getenv("POLL_SEC", "1"))
+POLL_SEC = float(os.getenv("POLL_SEC", os.getenv("POLL_SECONDS", "1")))
 
 ABCEX_EMAIL = os.getenv("ABCEX_EMAIL", "")
 ABCEX_PASSWORD = os.getenv("ABCEX_PASSWORD", "")
@@ -36,12 +37,22 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))
-WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "30000"))
+# Если в таблице есть уникальный индекс/constraint под эти поля — включи on_conflict.
+# Подставь реальные имена колонок, если у тебя отличаются.
+SUPABASE_ON_CONFLICT = os.getenv(
+    "SUPABASE_ON_CONFLICT",
+    "source,symbol,trade_time,price,volume_usdt",
+)
 
-# Render cache path
-BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
+# Playwright cache path (Render-friendly)
+PW_BROWSERS_PATH = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
+
+# Таймауты
+GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "120000"))
+UI_TIMEOUT_MS = int(os.getenv("UI_TIMEOUT_MS", "30000"))
+
+# Headless
+HEADLESS = os.getenv("ABCEX_HEADLESS", "1").strip() not in ("0", "false", "False")
 
 # ───────────────────────── LOGGING ─────────────────────────
 
@@ -49,64 +60,130 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
 )
-log = logging.getLogger("abcex")
+logger = logging.getLogger("abcex-render")
 
-# ───────────────────────── INSTALL (строго как у тебя) ─────────────────────────
+TIME_RE = re.compile(r"\b\d{2}:\d{2}:\d{2}\b")
 
-def _env_without_proxies() -> Dict[str, str]:
+Q8 = Decimal("0.00000001")
+
+
+# ───────────────────────── HELPERS ─────────────────────────
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def normalize_decimal(text: str) -> Optional[Decimal]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    t = t.replace("\xa0", " ").replace(" ", "")
+    # 1,234.56 => 1234.56 (если оба есть)
+    if "," in t and "." in t:
+        t = t.replace(",", "")
+    else:
+        t = t.replace(",", ".")
+    try:
+        return Decimal(t)
+    except (InvalidOperation, ValueError):
+        return None
+
+def q8_str(x: Decimal) -> str:
+    return str(x.quantize(Q8, rounding=ROUND_HALF_UP))
+
+def extract_time(text: str) -> Optional[str]:
+    m = TIME_RE.search((text or "").replace("\xa0", " "))
+    if not m:
+        return None
+    return m.group(0)
+
+def parse_proxy_from_env() -> Optional[Dict[str, str]]:
     """
-    На playwright install убираем прокси — иначе скачивание CDN может рваться.
+    Playwright proxy dict:
+      {"server": "http://host:port", "username": "...", "password": "..."}
+    Берём HTTPS_PROXY, если нет — HTTP_PROXY.
     """
-    env = dict(os.environ)
-    for k in [
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-    ]:
-        env.pop(k, None)
-    env["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
-    return env
+    raw = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    if not raw:
+        return None
+
+    u = urlparse(raw)
+    if not u.scheme or not u.hostname or not u.port:
+        logger.warning("Proxy URL looks invalid: %s", raw)
+        return None
+
+    proxy: Dict[str, str] = {
+        "server": f"{u.scheme}://{u.hostname}:{u.port}",
+    }
+    if u.username:
+        proxy["username"] = u.username
+    if u.password:
+        proxy["password"] = u.password
+
+    return proxy
 
 
-def _headless_shell_exists() -> bool:
-    pattern = os.path.join(BROWSERS_ROOT, "chromium_headless_shell-*", "chrome-linux", "headless_shell")
-    return len(glob.glob(pattern)) > 0
+# ───────────────────────── PLAYWRIGHT INSTALL (как в твоём фрагменте 2) ─────────────────────────
 
+_last_install_ts = 0.0
 
-def _chromium_exists() -> bool:
-    pattern = os.path.join(BROWSERS_ROOT, "chromium-*", "chrome-linux", "chrome")
-    return len(glob.glob(pattern)) > 0
+def _browsers_exist() -> Tuple[bool, bool]:
+    """
+    Проверяем наличие chromium и chromium-headless-shell в кеше.
+    Точная структура зависит от версии, но папки обычно:
+      chromium-XXXX
+      chromium_headless_shell-XXXX
+    """
+    if not os.path.isdir(PW_BROWSERS_PATH):
+        return (False, False)
 
+    has_chromium = any(name.startswith("chromium-") for name in os.listdir(PW_BROWSERS_PATH))
+    has_headless = any(name.startswith("chromium_headless_shell-") for name in os.listdir(PW_BROWSERS_PATH))
+    return (has_chromium, has_headless)
 
-def ensure_playwright_browsers(force: bool = False) -> None:
+def _playwright_install(force: bool = False) -> None:
     """
     Runtime-установка браузеров.
-    Именно: python -m playwright install chromium chromium-headless-shell
+    Ставим и chromium, и chromium-headless-shell.
+    ВАЖНО: делаем это sys.executable -m playwright ... (ровно как твой фрагмент 2).
     """
-    if not force and _chromium_exists() and _headless_shell_exists():
-        log.info("Playwright browsers already present.")
+    global _last_install_ts
+
+    # Если уже есть — не дёргаем install без нужды
+    chromium_ok, headless_ok = _browsers_exist()
+    if chromium_ok and headless_ok and not force:
+        logger.info("Playwright browsers already present. Skipping install.")
         return
 
-    log.warning("Installing Playwright browsers (runtime) to %s ... force=%s", BROWSERS_ROOT, force)
-    r = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=_env_without_proxies(),
-        timeout=15 * 60,
-    )
+    now = time.time()
+    # мягкий cooldown только если НЕ force
+    if not force and (now - _last_install_ts) < 600:
+        logger.warning("Playwright install was attempted recently; skipping (cooldown).")
+        return
+    _last_install_ts = now
 
-    log.warning("playwright install returncode=%s", r.returncode)
-    if r.stdout:
-        log.warning("playwright install STDOUT (tail):\n%s", r.stdout[-4000:])
-    if r.stderr:
-        log.warning("playwright install STDERR (tail):\n%s", r.stderr[-4000:])
+    logger.warning("Installing Playwright browsers (runtime)... force=%s", force)
+    env = os.environ.copy()
+    env["PLAYWRIGHT_BROWSERS_PATH"] = PW_BROWSERS_PATH
 
-    if r.returncode != 0:
-        raise RuntimeError("playwright install failed")
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        logger.warning("playwright install returncode=%s", r.returncode)
+        if r.stdout:
+            logger.warning("playwright install STDOUT:\n%s", r.stdout[-4000:])
+        if r.stderr:
+            logger.warning("playwright install STDERR:\n%s", r.stderr[-4000:])
 
-    log.warning("Install verification: chromium=%s headless_shell=%s", _chromium_exists(), _headless_shell_exists())
+    except Exception as e:
+        logger.error("Cannot run playwright install: %s", e)
 
+    chromium_ok, headless_ok = _browsers_exist()
+    logger.warning("Install verification: chromium=%s headless_shell=%s", chromium_ok, headless_ok)
 
 def _should_force_install(err: Exception) -> bool:
     s = str(err)
@@ -117,380 +194,352 @@ def _should_force_install(err: Exception) -> bool:
         or ("ms-playwright" in s and "doesn't exist" in s)
     )
 
-# ───────────────────────── PROXY ─────────────────────────
 
-def _get_proxy_url() -> Optional[str]:
-    return os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
-
-
-def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
-    u = urlsplit(proxy_url)
-    if not u.scheme or not u.hostname or not u.port:
-        return {"server": proxy_url}
-    out: Dict[str, Any] = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
-    if u.username:
-        out["username"] = u.username
-    if u.password:
-        out["password"] = u.password
-    return out
-
-# ───────────────────────── UTILS ─────────────────────────
-
-TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
-
-def _normalize_num(text: str) -> float:
-    t = (text or "").strip().replace("\xa0", " ").replace(" ", "")
-    if "," in t and "." in t:
-        t = t.replace(",", "")
-    else:
-        t = t.replace(",", ".")
-    return float(t)
-
-def _extract_time(text: str) -> Optional[str]:
-    m = TIME_RE.search((text or "").replace("\xa0", " "))
-    if not m:
-        return None
-    raw = m.group(1)
-    parts = raw.split(":")
-    if len(parts) == 2:
-        hh, mm = parts
-        if len(hh) == 1:
-            hh = "0" + hh
-        return f"{hh}:{mm}:00"
-    hh, mm, ss = parts
-    if len(hh) == 1:
-        hh = "0" + hh
-    return f"{hh}:{mm}:{ss}"
-
-def _trade_time_to_iso_moscow(hhmmss: str) -> str:
-    now = datetime.utcnow() + timedelta(hours=3)
-    h, m, s = [int(x) for x in hhmmss.split(":")]
-    dt = now.replace(hour=h, minute=m, second=s, microsecond=0)
-    if dt > now + timedelta(seconds=2):
-        dt -= timedelta(days=1)
-    return dt.isoformat()
+# ───────────────────────── DEBUG ─────────────────────────
 
 async def save_debug(page: Page, tag: str) -> None:
-    """
-    Сохраняем скрин и html. На Render их можно посмотреть через Shell.
-    """
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    png = f"debug_{tag}_{ts}.png"
-    html = f"debug_{tag}_{ts}.html"
+    png_path = os.path.join(DEBUG_DIR, f"{tag}_{ts}.png")
+    html_path = os.path.join(DEBUG_DIR, f"{tag}_{ts}.html")
     try:
-        await page.screenshot(path=png, full_page=True)
-        log.warning("Saved debug screenshot: %s", png)
+        await page.screenshot(path=png_path, full_page=True)
+        logger.info("Saved debug screenshot: %s", png_path)
     except Exception as e:
-        log.warning("Could not save screenshot: %s", e)
+        logger.warning("Could not save screenshot: %s", e)
 
     try:
         content = await page.content()
-        with open(html, "w", encoding="utf-8") as f:
+        with open(html_path, "w", encoding="utf-8") as f:
             f.write(content)
-        log.warning("Saved debug html: %s", html)
+        logger.info("Saved debug html: %s", html_path)
     except Exception as e:
-        log.warning("Could not save html: %s", e)
+        logger.warning("Could not save html: %s", e)
 
-# ───────────────────────── PAGE ACTIONS ─────────────────────────
+
+# ───────────────────────── NAVIGATION ─────────────────────────
+
+async def goto_stable(page: Page, url: str) -> None:
+    """
+    Для SPA: грузим до domcontentloaded и даём UI догрузиться.
+    НЕ используем networkidle.
+    """
+    await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+    await page.wait_for_timeout(1200)
 
 async def accept_cookies_if_any(page: Page) -> None:
-    for txt in ["Принять", "Согласен", "Я согласен", "Accept", "I agree"]:
+    for label in ["Принять", "Согласен", "Я согласен", "Accept", "I agree"]:
         try:
-            btn = page.locator(f"text={txt}")
+            btn = page.locator(f"text={label}")
             if await btn.count() > 0 and await btn.first.is_visible():
-                log.info("Cookies banner: clicking '%s'...", txt)
+                logger.info("Cookies banner: clicking '%s'...", label)
                 await btn.first.click(timeout=5_000)
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(400)
                 return
         except Exception:
             pass
-
-async def _find_visible_in_frames(page: Page, selectors: List[str]) -> Optional[Locator]:
-    for fr in page.frames:
-        for sel in selectors:
-            try:
-                loc = fr.locator(sel)
-                cnt = await loc.count()
-                if cnt <= 0:
-                    continue
-                for i in range(min(cnt, 8)):
-                    cand = loc.nth(i)
-                    if await cand.is_visible():
-                        return cand
-            except Exception:
-                continue
-    return None
-
-async def _is_login_visible(page: Page) -> bool:
-    pw = await _find_visible_in_frames(page, [
-        "input[type='password']",
-        "input[autocomplete='current-password']",
-        "input[name*='pass' i]",
-    ])
-    return pw is not None
-
-async def _open_login_modal_if_needed(page: Page) -> None:
-    if await _is_login_visible(page):
-        return
-    for sel in [
-        "text=Войти", "text=Login", "text=Sign in",
-        "a:has-text('Войти')", "button:has-text('Войти')",
-        "button:has-text('Login')", "button:has-text('Sign in')",
-    ]:
-        try:
-            btn = page.locator(sel)
-            if await btn.count() > 0 and await btn.first.is_visible():
-                await btn.first.click(timeout=7_000)
-                await page.wait_for_timeout(700)
-                return
-        except Exception:
-            pass
-
-async def login_if_needed(page: Page, email: str, password: str) -> None:
-    await _open_login_modal_if_needed(page)
-
-    if not await _is_login_visible(page):
-        log.info("Login not required (no password field detected).")
-        return
-
-    log.info("Login detected. Performing sign-in ...")
-
-    email_loc = await _find_visible_in_frames(page, [
-        "input[type='email']",
-        "input[name='email']",
-        "input[name*='mail' i]",
-        "input[placeholder*='mail' i]",
-        "input[placeholder*='email' i]",
-        "input[placeholder*='почта' i]",
-        "input[autocomplete='username']",
-        "input[type='text'][name*='login' i]",
-    ])
-    pw_loc = await _find_visible_in_frames(page, [
-        "input[type='password']",
-        "input[autocomplete='current-password']",
-        "input[name*='pass' i]",
-    ])
-
-    if email_loc is None or pw_loc is None:
-        await save_debug(page, "login_fields_not_found")
-        raise RuntimeError("Не смог найти поля email/password.")
-
-    await email_loc.fill(email, timeout=10_000)
-    await pw_loc.fill(password, timeout=10_000)
-
-    btn = await _find_visible_in_frames(page, [
-        "button:has-text('Войти')",
-        "button:has-text('Вход')",
-        "button:has-text('Sign in')",
-        "button:has-text('Login')",
-        "button[type='submit']",
-    ])
-    if btn is not None:
-        try:
-            await btn.click(timeout=10_000)
-        except Exception:
-            try:
-                await page.keyboard.press("Enter")
-            except Exception:
-                pass
-    else:
-        try:
-            await page.keyboard.press("Enter")
-        except Exception:
-            pass
-
-    await page.wait_for_timeout(800)
-    for _ in range(40):
-        if not await _is_login_visible(page):
-            log.info("Login successful (password field disappeared).")
-            return
-        await page.wait_for_timeout(400)
-
-    await save_debug(page, "login_failed")
-    raise RuntimeError("Логин не прошёл (форма логина всё ещё видна).")
 
 async def click_trades_tab_best_effort(page: Page) -> None:
-    for t in ["Сделки", "История", "Order history", "Trades", "Последние сделки"]:
+    candidates = [
+        "Сделки", "История", "История сделок", "История ордеров",
+        "Order history", "Trades", "Trade history", "My trades",
+    ]
+    # role=tab
+    for t in candidates:
         try:
             tab = page.locator(f"[role='tab']:has-text('{t}')")
             if await tab.count() > 0 and await tab.first.is_visible():
                 await tab.first.click(timeout=8_000)
                 await page.wait_for_timeout(600)
+                logger.info("Clicked tab: %s", t)
                 return
         except Exception:
             continue
-    for t in ["Сделки", "История", "Order history", "Trades", "Последние сделки"]:
+
+    # fallback text
+    for t in candidates:
         try:
             tab = page.locator(f"text={t}")
             if await tab.count() > 0 and await tab.first.is_visible():
                 await tab.first.click(timeout=8_000)
                 await page.wait_for_timeout(600)
+                logger.info("Clicked text tab: %s", t)
                 return
         except Exception:
             continue
 
-async def wait_trades_visible(page: Page, timeout_ms: int) -> None:
-    """
-    Ждём появления времени HH:MM или HH:MM:SS где угодно в DOM.
-    """
+    logger.info("Trades tab click skipped (not found explicitly).")
+
+async def wait_trades_visible(page: Page, timeout_ms: int = 30_000) -> None:
     start = time.time()
     while (time.time() - start) * 1000 < timeout_ms:
         try:
             ok = await page.evaluate(
                 """() => {
-                    const re = /\\b\\d{1,2}:\\d{2}(?::\\d{2})?\\b/;
-                    const els = Array.from(document.querySelectorAll('p,span,div'));
-                    return els.some(e => {
-                      const t = (e.textContent||'').trim();
-                      return t.length <= 16 && re.test(t);
-                    });
+                    const re = /^\\d{2}:\\d{2}:\\d{2}$/;
+                    const ps = Array.from(document.querySelectorAll('p'));
+                    return ps.some(p => re.test((p.textContent||'').trim()));
                 }"""
             )
             if ok:
-                log.info("Trades look visible (time tokens detected).")
+                logger.info("Trades look visible (HH:MM:SS detected in DOM).")
                 return
         except Exception:
             pass
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(600)
 
     await save_debug(page, "trades_not_visible")
-    raise RuntimeError("Не дождался появления сделок (time tokens).")
+    raise RuntimeError("Не дождался появления сделок (HH:MM:SS).")
 
-# ───────────────────────── PARSING (НЕ привязано к <p>) ─────────────────────────
 
-async def extract_trades_anywhere(page: Page, limit: int) -> List[Dict[str, Any]]:
+# ───────────────────────── LOGIN ─────────────────────────
+
+async def _is_login_visible(page: Page) -> bool:
+    try:
+        pw = page.locator("input[type='password']")
+        if await pw.count() > 0 and await pw.first.is_visible():
+            return True
+    except Exception:
+        pass
+    return False
+
+async def login_if_needed(page: Page, email: str, password: str) -> None:
+    if not await _is_login_visible(page):
+        logger.info("Login not required (no password field detected).")
+        return
+
+    if not email or not password:
+        raise RuntimeError("Login required but ABCEX_EMAIL / ABCEX_PASSWORD are empty.")
+
+    logger.info("Login detected. Performing sign-in ...")
+
+    # Дождёмся появления password (на SPA иногда рендерится с задержкой)
+    try:
+        await page.locator("input[type='password']").first.wait_for(timeout=15_000)
+    except Exception:
+        pass
+
+    email_candidates = [
+        "input[type='email']",
+        "input[name='email']",
+        "input[autocomplete='username']",
+        "input[name='login']",
+        "input[placeholder*='mail' i]",
+        "input[placeholder*='Email' i]",
+        "input[placeholder*='Почта' i]",
+        "input[placeholder*='E-mail' i]",
+    ]
+    pw_candidates = [
+        "input[type='password']",
+        "input[name='password']",
+        "input[autocomplete='current-password']",
+        "input[placeholder*='Пароль' i]",
+        "input[placeholder*='Password' i]",
+    ]
+
+    email_filled = False
+    for sel in email_candidates:
+        loc = page.locator(sel)
+        try:
+            if await loc.count() > 0 and await loc.first.is_visible():
+                await loc.first.fill(email, timeout=10_000)
+                email_filled = True
+                break
+        except Exception:
+            continue
+
+    pw_filled = False
+    for sel in pw_candidates:
+        loc = page.locator(sel)
+        try:
+            if await loc.count() > 0 and await loc.first.is_visible():
+                await loc.first.fill(password, timeout=10_000)
+                pw_filled = True
+                break
+        except Exception:
+            continue
+
+    if not email_filled or not pw_filled:
+        await save_debug(page, "login_fields_not_found")
+        raise RuntimeError("Не смог найти поля email/password.")
+
+    btn_texts = ["Войти", "Вход", "Sign in", "Login", "Войти в аккаунт"]
+    clicked = False
+    for t in btn_texts:
+        try:
+            btn = page.locator(f"button:has-text('{t}')")
+            if await btn.count() > 0 and await btn.first.is_visible():
+                await btn.first.click(timeout=10_000)
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        try:
+            await page.keyboard.press("Enter")
+        except Exception:
+            pass
+
+    # Подождём исчезновения password
+    try:
+        await page.wait_for_timeout(800)
+        await page.locator("input[type='password']").first.wait_for(state="detached", timeout=30_000)
+    except Exception:
+        pass
+
+    await page.wait_for_timeout(1200)
+
+    if await _is_login_visible(page):
+        await save_debug(page, "login_failed")
+        raise RuntimeError("Логин не прошёл (форма логина всё ещё видна).")
+
+    logger.info("Login successful (password field disappeared).")
+
+
+# ───────────────────────── PARSING ─────────────────────────
+
+@dataclass
+class Trade:
+    price: Decimal
+    volume_usdt: Decimal
+    trade_time: str  # HH:MM:SS (как в UI)
+    side: Optional[str] = None
+    price_raw: str = ""
+    volume_raw: str = ""
+
+def _is_time(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{2}:\d{2}:\d{2}", (s or "").strip()))
+
+async def get_order_history_panel(page: Page) -> Optional[Locator]:
+    panel = page.locator("div[role='tabpanel'][id*='panel-orderHistory']")
+    try:
+        cnt = await panel.count()
+    except Exception:
+        return None
+    if cnt == 0:
+        return None
+    for i in range(cnt):
+        p = panel.nth(i)
+        try:
+            if await p.is_visible():
+                return p
+        except Exception:
+            continue
+    return None
+
+async def extract_trades_triplets(root: Any, limit: int) -> List[Dict[str, Any]]:
     """
-    Универсальный DOM-парсер:
-    - находим элементы с временем HH:MM(:SS)
-    - для каждого времени берём ближайший “ряд” (ancestor div),
-      и из текстов в DOM-порядке берём 2 числа перед временем (price/qty)
+    Универсальный JS-экстрактор:
+    ищет блоки, где есть 3 прямых <p>: [price, qty, time]
     """
-    raw: List[Dict[str, Any]] = await page.evaluate(
-        """(limit) => {
-          const isTime = (s) => /\\b\\d{1,2}:\\d{2}(?::\\d{2})?\\b/.test((s||'').trim());
-          const normTime = (s) => {
-            const m = ((s||'').match(/\\b(\\d{1,2}:\\d{2}(?::\\d{2})?)\\b/)||[])[1];
-            if (!m) return null;
-            const parts = m.split(':');
-            if (parts.length === 2) {
-              let [hh, mm] = parts;
-              if (hh.length === 1) hh = '0'+hh;
-              return `${hh}:${mm}:00`;
-            }
-            let [hh, mm, ss] = parts;
-            if (hh.length === 1) hh = '0'+hh;
-            return `${hh}:${mm}:${ss}`;
-          };
+    return await root.evaluate(
+        """(node, limit) => {
+          const isTime = (s) => /^\\d{2}:\\d{2}:\\d{2}$/.test((s||'').trim());
+          const isNum  = (s) => /^[0-9][0-9\\s\\u00A0.,]*$/.test((s||'').trim());
 
-          const isNum = (s) => /^[0-9][0-9\\s\\u00A0.,]*$/.test((s||'').trim());
+          const out = [];
 
-          // собираем кандидаты "time elements"
-          const timeEls = Array.from(document.querySelectorAll('p,span,div'))
-            .filter(e => {
-              const t = (e.textContent||'').trim();
-              return t && t.length <= 16 && isTime(t);
-            });
+          const root = node || document;
+          const divs = Array.from(root.querySelectorAll('div'));
 
-          const rows = [];
-          const seen = new Set();
+          for (const d of divs) {
+            const ps = Array.from(d.querySelectorAll(':scope > p'));
+            if (ps.length < 3) continue;
 
-          for (const te of timeEls) {
-            // поднимаемся вверх: ищем div-ряд, где есть хотя бы 2 числа + время
-            let node = te;
-            for (let up = 0; up < 8 && node; up++) {
-              const cand = node.closest ? node.closest('div') : null;
-              if (!cand) break;
-              node = cand.parentElement;
+            const t0 = (ps[0].textContent || '').trim();
+            const t1 = (ps[1].textContent || '').trim();
+            const t2 = (ps[2].textContent || '').trim();
 
-              const texts = [];
-              const walker = document.createTreeWalker(cand, NodeFilter.SHOW_ELEMENT, null);
-              let cur = walker.currentNode;
-              while (cur) {
-                const el = cur;
-                const tx = (el.textContent||'').trim();
-                // берем только короткие "ячейки", чтобы не схватить весь блок
-                if (tx && tx.length <= 32) texts.push(tx);
-                cur = walker.nextNode();
-              }
+            if (!isTime(t2)) continue;
+            if (!isNum(t0) || !isNum(t1)) continue;
 
-              const tnorm = normTime(te.textContent||'');
-              if (!tnorm) continue;
+            const style0 = (ps[0].getAttribute('style') || '').toLowerCase();
+            let side = null;
+            if (style0.includes('green')) side = 'buy';
+            if (style0.includes('red')) side = 'sell';
 
-              // найдём позицию времени и 2 числа перед ним
-              let timeIdx = -1;
-              for (let i = 0; i < texts.length; i++) {
-                if (normTime(texts[i]) === tnorm) { timeIdx = i; break; }
-              }
-              if (timeIdx < 0) continue;
-
-              // собираем числовые токены до времени
-              const nums = [];
-              for (let i = 0; i < timeIdx; i++) {
-                const s = texts[i].replace(/\\u00A0/g,' ').trim();
-                if (isNum(s)) nums.push(s);
-              }
-              if (nums.length < 2) continue;
-
-              const price_raw = nums[nums.length - 2];
-              const qty_raw = nums[nums.length - 1];
-
-              // side по стилю: ищем элемент, чья textContent == price_raw
-              let side = null;
-              const priceEl = Array.from(cand.querySelectorAll('*')).find(x => (x.textContent||'').trim() === price_raw);
-              if (priceEl) {
-                const st = (priceEl.getAttribute('style') || '').toLowerCase();
-                if (st.includes('green')) side = 'buy';
-                if (st.includes('red')) side = 'sell';
-              }
-
-              const key = `${tnorm}|${price_raw}|${qty_raw}`;
-              if (seen.has(key)) break;
-              seen.add(key);
-
-              rows.push({ time: tnorm, price_raw, qty_raw, side });
-              break;
-            }
-
-            if (rows.length >= limit) break;
+            out.push({ price_raw: t0, volume_raw: t1, trade_time: t2, side });
+            if (out.length >= limit) break;
           }
 
-          return rows.slice(0, limit);
+          return out;
         }""",
         limit,
     )
 
-    trades: List[Dict[str, Any]] = []
-    for r in raw:
-        try:
-            price_raw = str(r.get("price_raw", "")).strip()
-            qty_raw = str(r.get("qty_raw", "")).strip()
-            tt = str(r.get("time", "")).strip()
-            side = r.get("side", None)
+async def extract_trades(page: Page, limit: int) -> List[Trade]:
+    # 1) Пытаемся через panel-orderHistory (как у тебя локально)
+    panel = await get_order_history_panel(page)
+    if panel is not None:
+        handle = await panel.element_handle()
+        if handle is not None:
+            raw = await extract_trades_triplets(handle, limit)
+            trades = _normalize_trades(raw)
+            if trades:
+                return trades
 
-            price = _normalize_num(price_raw)
-            qty = _normalize_num(qty_raw)
+    # 2) Fallback: скан по всему document
+    logger.warning("panel-orderHistory not found or empty. Using fallback DOM scan...")
+    raw2 = await page.evaluate(
+        """(limit) => {
+          const isTime = (s) => /^\\d{2}:\\d{2}:\\d{2}$/.test((s||'').trim());
+          const isNum  = (s) => /^[0-9][0-9\\s\\u00A0.,]*$/.test((s||'').trim());
 
-            trade_time_iso = _trade_time_to_iso_moscow(tt)
+          const out = [];
+          const divs = Array.from(document.querySelectorAll('div'));
+          for (const d of divs) {
+            const ps = Array.from(d.querySelectorAll(':scope > p'));
+            if (ps.length < 3) continue;
 
-            trades.append(
-                {
-                    "source": SOURCE,
-                    "symbol": SYMBOL,
-                    "trade_time": trade_time_iso,
-                    "price": str(price),
-                    "volume_usdt": str(qty),
-                    "turnover_rub": str(price * qty),
-                    "side": side if side in ("buy", "sell") else None,
-                    "price_raw": price_raw,
-                    "qty_raw": qty_raw,
-                    "raw_time": tt,
-                    "parsed_at": datetime.utcnow().isoformat(),
-                }
-            )
-        except Exception:
+            const t0 = (ps[0].textContent || '').trim();
+            const t1 = (ps[1].textContent || '').trim();
+            const t2 = (ps[2].textContent || '').trim();
+
+            if (!isTime(t2)) continue;
+            if (!isNum(t0) || !isNum(t1)) continue;
+
+            const style0 = (ps[0].getAttribute('style') || '').toLowerCase();
+            let side = null;
+            if (style0.includes('green')) side = 'buy';
+            if (style0.includes('red')) side = 'sell';
+
+            out.push({ price_raw: t0, volume_raw: t1, trade_time: t2, side });
+            if (out.length >= limit) break;
+          }
+          return out;
+        }""",
+        limit,
+    )
+    return _normalize_trades(raw2)
+
+def _normalize_trades(raw_rows: List[Dict[str, Any]]) -> List[Trade]:
+    trades: List[Trade] = []
+    for r in raw_rows or []:
+        pr = str(r.get("price_raw", "")).strip()
+        vr = str(r.get("volume_raw", "")).strip()
+        tt = str(r.get("trade_time", "")).strip()
+        side = r.get("side")
+
+        if not pr or not vr or not tt or not _is_time(tt):
             continue
 
+        price = normalize_decimal(pr)
+        vol = normalize_decimal(vr)
+        if price is None or vol is None:
+            continue
+
+        trades.append(
+            Trade(
+                price=price,
+                volume_usdt=vol,
+                trade_time=tt,
+                side=side if side in ("buy", "sell") else None,
+                price_raw=pr,
+                volume_raw=vr,
+            )
+        )
     return trades
+
 
 # ───────────────────────── SUPABASE ─────────────────────────
 
@@ -504,121 +553,198 @@ class TradeKey:
 
 def trade_key(t: Dict[str, Any]) -> TradeKey:
     return TradeKey(
-        source=str(t.get("source", "")),
-        symbol=str(t.get("symbol", "")),
-        trade_time=str(t.get("trade_time", "")),
-        price=str(t.get("price", "")),
-        volume_usdt=str(t.get("volume_usdt", "")),
+        source=t["source"],
+        symbol=t["symbol"],
+        trade_time=t["trade_time"],
+        price=t["price"],
+        volume_usdt=t["volume_usdt"],
     )
 
-async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> None:
+async def supabase_insert_rows(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
     if not SUPABASE_URL or not SUPABASE_KEY or not SUPABASE_TABLE:
-        log.warning("Supabase env is not fully set; skipping DB write.")
+        logger.warning("Supabase env not set (SUPABASE_URL/KEY/TABLE). Skipping insert.")
         return
 
-    url = SUPABASE_URL.rstrip("/") + f"/rest/v1/{SUPABASE_TABLE}"
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{SUPABASE_TABLE}"
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=minimal",
+        # merge-duplicates требует подходящего уникального ключа/constraint;
+        # если он есть — это лучший вариант.
+        "Prefer": "return=minimal,resolution=ignore-duplicates",
     }
 
-    async with httpx.AsyncClient(timeout=30.0, headers=headers, trust_env=True) as client:
-        resp = await client.post(url, content=json.dumps(rows, ensure_ascii=False).encode("utf-8"))
-        if resp.status_code in (200, 201, 204):
-            log.info("Supabase upsert OK: %s trades", len(rows))
-            return
-        log.error("Supabase write failed: %s %s", resp.status_code, resp.text[:1200])
+    params = {}
+    if SUPABASE_ON_CONFLICT:
+        params["on_conflict"] = SUPABASE_ON_CONFLICT
 
-# ───────────────────────── CORE ─────────────────────────
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, headers=headers, params=params, json=rows)
 
-async def run_once() -> List[Dict[str, Any]]:
-    proxy_url = _get_proxy_url()
-    pw_proxy = _parse_proxy_for_playwright(proxy_url) if proxy_url else None
+    if resp.status_code in (200, 201, 204):
+        logger.info("Inserted rows into Supabase: %d", len(rows))
+        return
+
+    # 409/409-like — конфликт уникальности (зависит от конфигурации)
+    if resp.status_code in (409,):
+        logger.info("Supabase conflict (duplicates). Rows=%d", len(rows))
+        return
+
+    logger.error("Supabase insert failed: status=%s body=%s", resp.status_code, resp.text[:2000])
+
+
+# ───────────────────────── MAIN LOOP ─────────────────────────
+
+def build_rows(trades: List[Trade]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for t in trades:
+        turnover_rub = (t.price * t.volume_usdt) if (t.price and t.volume_usdt) else None
+        out.append(
+            {
+                "source": SOURCE,
+                "symbol": SYMBOL,
+                "trade_time": t.trade_time,
+                "price": q8_str(t.price),
+                "volume_usdt": q8_str(t.volume_usdt),
+                "turnover_rub": q8_str(turnover_rub) if turnover_rub is not None else None,
+                "side": t.side,
+                "fetched_at": _utc_iso(),
+                "meta": json.dumps({"price_raw": t.price_raw, "volume_raw": t.volume_raw}, ensure_ascii=False),
+            }
+        )
+    return out
+
+async def run_once(page: Page) -> List[Dict[str, Any]]:
+    logger.info("Opening ABCEX: %s", ABCEX_URL)
+    await goto_stable(page, ABCEX_URL)
+
+    await accept_cookies_if_any(page)
+
+    # Логин при необходимости
+    if await _is_login_visible(page):
+        await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
+        # После логина часто редиректит на /client/spot — вернёмся на конкретную пару
+        await goto_stable(page, ABCEX_URL)
+
+    # Клик таба "Сделки" (best effort)
+    await click_trades_tab_best_effort(page)
+
+    # Ждём появления HH:MM:SS
+    await wait_trades_visible(page, timeout_ms=30_000)
+
+    trades = await extract_trades(page, limit=LIMIT)
+    logger.info("Parsed trades: %d", len(trades))
+    return build_rows(trades)
+
+async def main() -> None:
+    # 0) Установка браузеров (runtime)
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = PW_BROWSERS_PATH
+    _playwright_install(force=False)
+
+    proxy = parse_proxy_from_env()
+
+    # in-memory dedup, чтобы не спамить supabase
+    seen: set[TradeKey] = set()
 
     async with async_playwright() as p:
-        browser = None
-        for attempt in (1, 2):
-            try:
-                kwargs: Dict[str, Any] = {
-                    "headless": True,
-                    "args": [
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                    ],
-                }
-                if pw_proxy:
-                    kwargs["proxy"] = pw_proxy
+        # 1) Запуск браузера с обработкой missing-executable
+        launch_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+        ]
 
-                browser = await p.chromium.launch(**kwargs)
+        for attempt in range(1, 4):
+            try:
+                browser = await p.chromium.launch(
+                    headless=HEADLESS,
+                    args=launch_args,
+                    proxy=proxy,
+                )
                 break
             except Exception as e:
-                if _should_force_install(e):
-                    log.warning("Chromium launch failed; forcing install and retry... attempt=%s", attempt)
-                    ensure_playwright_browsers(force=True)
-                    await asyncio.sleep(2.0)
+                if _should_force_install(e) and attempt < 3:
+                    logger.warning("Chromium launch failed (missing executable). Forcing install and retry... attempt=%s", attempt)
+                    _playwright_install(force=True)
+                    await asyncio.sleep(1)
                     continue
                 raise
 
-        if browser is None:
-            raise RuntimeError("Cannot launch browser after retries.")
-
         storage_state = STATE_PATH if os.path.exists(STATE_PATH) else None
         if storage_state:
-            log.info("Using saved session state: %s", storage_state)
+            logger.info("Using saved session state: %s", storage_state)
 
         context = await browser.new_context(
-            viewport={"width": 1440, "height": 810},
+            viewport={"width": 1440, "height": 900},
             locale="ru-RU",
             timezone_id="Europe/Moscow",
+            storage_state=storage_state,
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/131.0.0.0 Safari/537.36"
             ),
-            storage_state=storage_state,
         )
+        context.set_default_navigation_timeout(GOTO_TIMEOUT_MS)
+        context.set_default_timeout(UI_TIMEOUT_MS)
 
         page = await context.new_page()
 
         try:
-            log.info("Opening ABCEX: %s", ABCEX_URL)
-            await page.goto(ABCEX_URL, wait_until="networkidle", timeout=GOTO_TIMEOUT_MS)
-            await page.wait_for_timeout(1500)
+            while True:
+                try:
+                    rows = await run_once(page)
 
-            await accept_cookies_if_any(page)
+                    # in-memory dedup
+                    new_rows = []
+                    for r in rows:
+                        k = trade_key(r)
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        new_rows.append(r)
 
-            if not ABCEX_EMAIL or not ABCEX_PASSWORD:
-                raise RuntimeError("ABCEX_EMAIL/ABCEX_PASSWORD must be set in env.")
-            await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
+                    if not new_rows:
+                        logger.info("No new trades after in-memory dedup.")
+                    else:
+                        await supabase_insert_rows(new_rows)
 
-            # После логина сайт иногда уводит на /client/spot без пары — фиксируем.
-            await page.goto(ABCEX_URL, wait_until="networkidle", timeout=GOTO_TIMEOUT_MS)
-            await page.wait_for_timeout(1200)
+                except PWTimeoutError as e:
+                    logger.error("Cycle error: %s", e)
+                    try:
+                        await save_debug(page, "timeout")
+                    except Exception:
+                        pass
+                    # перезагрузим вкладку, но без networkidle
+                    try:
+                        await goto_stable(page, ABCEX_URL)
+                    except Exception:
+                        pass
 
-            try:
-                await context.storage_state(path=STATE_PATH)
-                log.info("Saved session state to %s", STATE_PATH)
-            except Exception as e:
-                log.warning("Could not save storage state: %s", e)
+                except Exception as e:
+                    logger.error("Cycle error: %s", e)
+                    try:
+                        await save_debug(page, "cycle_error")
+                    except Exception:
+                        pass
+                    # мягкий reset: перезагрузим страницу
+                    try:
+                        await goto_stable(page, ABCEX_URL)
+                    except Exception:
+                        pass
 
-            await click_trades_tab_best_effort(page)
-            await wait_trades_visible(page, timeout_ms=WAIT_TRADES_TIMEOUT_MS)
-
-            trades = await extract_trades_anywhere(page, limit=LIMIT)
-
-            log.info("Parsed trades: %d", len(trades))
-            if len(trades) == 0:
-                # Это ключевой момент: если 0, сохраняем артефакты
-                await save_debug(page, "parsed_zero_trades")
-
-            return trades
+                await asyncio.sleep(POLL_SEC)
 
         finally:
+            try:
+                await context.storage_state(path=STATE_PATH)
+                logger.info("Saved session state to %s", STATE_PATH)
+            except Exception:
+                pass
+
             try:
                 await page.close()
             except Exception:
@@ -631,43 +757,6 @@ async def run_once() -> List[Dict[str, Any]]:
                 await browser.close()
             except Exception:
                 pass
-
-
-async def main() -> None:
-    ensure_playwright_browsers(force=False)
-
-    seen: Dict[TradeKey, float] = {}
-    seen_ttl = 60 * 30
-
-    while True:
-        try:
-            trades = await run_once()
-
-            now = time.time()
-            for k, ts in list(seen.items()):
-                if now - ts > seen_ttl:
-                    del seen[k]
-
-            fresh: List[Dict[str, Any]] = []
-            for t in trades:
-                k = trade_key(t)
-                if k in seen:
-                    continue
-                seen[k] = now
-                fresh.append(t)
-
-            if fresh:
-                await supabase_upsert_trades(fresh)
-            else:
-                log.info("No new trades after in-memory dedup.")
-
-        except Exception as e:
-            log.error("Cycle error: %s", e)
-            if _should_force_install(e):
-                ensure_playwright_browsers(force=True)
-            await asyncio.sleep(3.0)
-
-        await asyncio.sleep(POLL_SEC)
 
 
 if __name__ == "__main__":
