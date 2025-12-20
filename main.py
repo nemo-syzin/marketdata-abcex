@@ -26,7 +26,7 @@ STATE_PATH = os.getenv("STATE_PATH", "abcex_state.json")
 SOURCE = os.getenv("SOURCE", "abcex")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
-LIMIT = int(os.getenv("LIMIT", "200"))
+LIMIT = int(os.getenv("LIMIT", "120"))              # сколько строк брать из “Сделки”
 POLL_SEC = float(os.getenv("POLL_SEC", "2.0"))
 
 ABCEX_EMAIL = os.getenv("ABCEX_EMAIL", "")
@@ -51,11 +51,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("abcex")
 
-# ───────────────────────── INSTALL (как у тебя) ─────────────────────────
+# ───────────────────────── INSTALL ─────────────────────────
 
 def _env_without_proxies() -> Dict[str, str]:
     """
-    На playwright install убираем прокси — иначе скачивание CDN может рваться.
+    На playwright install убираем прокси — иначе скачивание CDN часто рвётся.
     """
     env = dict(os.environ)
     for k in [
@@ -76,32 +76,40 @@ def _chromium_exists() -> bool:
 
 def ensure_playwright_browsers(force: bool = False) -> None:
     """
-    Runtime-установка браузеров.
+    Runtime-установка браузеров с ретраями.
     """
     if not force and _chromium_exists() and _headless_shell_exists():
         log.info("Playwright browsers already present.")
         return
 
-    log.warning("Installing Playwright browsers (runtime) to %s ... force=%s", BROWSERS_ROOT, force)
-    r = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=_env_without_proxies(),
-        timeout=20 * 60,
-    )
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        log.warning("Installing Playwright browsers (runtime) to %s ... force=%s attempt=%s/%s",
+                    BROWSERS_ROOT, force, attempt, max_attempts)
+        r = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_env_without_proxies(),
+            timeout=25 * 60,
+        )
+        log.warning("playwright install returncode=%s", r.returncode)
+        if r.stdout:
+            log.warning("playwright install STDOUT (tail):\n%s", r.stdout[-4000:])
+        if r.stderr:
+            log.warning("playwright install STDERR (tail):\n%s", r.stderr[-4000:])
 
-    log.warning("playwright install returncode=%s", r.returncode)
-    if r.stdout:
-        log.warning("playwright install STDOUT (tail):\n%s", r.stdout[-4000:])
-    if r.stderr:
-        log.warning("playwright install STDERR (tail):\n%s", r.stderr[-4000:])
+        if r.returncode == 0 and _chromium_exists() and _headless_shell_exists():
+            log.warning("Install verification: chromium=True headless_shell=True")
+            return
 
-    if r.returncode != 0:
-        raise RuntimeError("playwright install failed")
+        if attempt < max_attempts:
+            sleep_s = 6 * attempt
+            log.warning("Install not complete yet. Sleeping %ss and retrying...", sleep_s)
+            time.sleep(sleep_s)
 
-    log.warning("Install verification: chromium=%s headless_shell=%s", _chromium_exists(), _headless_shell_exists())
+    raise RuntimeError("playwright install failed after retries")
 
 def _should_force_install(err: Exception) -> bool:
     s = str(err)
@@ -131,6 +139,7 @@ def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
 # ───────────────────────── NUMBERS / TIME ─────────────────────────
 
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
+STRICT_TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$")  # 00:00:00 .. 23:59:59
 
 def _q8(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
@@ -139,20 +148,17 @@ def _to_decimal_num(text: str) -> Decimal:
     """
     Грязестойкий парсер чисел:
     - убирает валюты/буквы/символы типа ₽, USDT
-    - поддерживает '191 889,47' / '191889.47'
+    - поддерживает '191 889,47' / '191889.47' / '14,964.9824'
     """
     t = (text or "").strip().replace("\xa0", " ")
     t = re.sub(r"[^0-9\s\.,]", "", t)  # оставляем цифры/пробел/./,
     t = t.replace(" ", "")
-
     if not t:
         raise InvalidOperation("empty numeric")
-
     if "," in t and "." in t:
-        t = t.replace(",", "")
+        t = t.replace(",", "")  # comma as thousand-sep
     else:
-        t = t.replace(",", ".")
-
+        t = t.replace(",", ".")  # comma as decimal
     return Decimal(t)
 
 def _normalize_time_to_hhmmss(text: str) -> Optional[str]:
@@ -163,15 +169,17 @@ def _normalize_time_to_hhmmss(text: str) -> Optional[str]:
     parts = raw.split(":")
     if len(parts) == 2:
         hh, mm = parts
-        if len(hh) == 1:
-            hh = "0" + hh
+        hh = hh.zfill(2)
         return f"{hh}:{mm}:00"
     hh, mm, ss = parts
-    if len(hh) == 1:
-        hh = "0" + hh
-    if len(ss) == 1:
-        ss = "0" + ss
+    hh = hh.zfill(2)
+    ss = ss.zfill(2)
     return f"{hh}:{mm}:{ss}"
+
+def _is_valid_time_hhmmss(tt: str) -> bool:
+    if not tt:
+        return False
+    return bool(STRICT_TIME_RE.match(tt))
 
 # ───────────────────────── DEBUG ARTIFACTS ─────────────────────────
 
@@ -315,7 +323,6 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
 
     await page.wait_for_timeout(900)
 
-    # ждём исчезновение password поля
     for _ in range(50):
         if not await _is_login_visible(page):
             log.info("Login successful (password field disappeared).")
@@ -347,111 +354,66 @@ async def click_trades_tab_best_effort(page: Page) -> None:
 
 # ───────────────────────── PARSING ─────────────────────────
 
-async def extract_trades_anywhere(page: Page, limit: int) -> List[Dict[str, Any]]:
+async def extract_trades_order_history(page: Page, limit: int) -> List[Dict[str, Any]]:
     """
-    Универсальный DOM-парсер:
-    - ищем элементы с временем HH:MM(:SS)
-    - поднимаемся вверх и пытаемся найти “ряд”, где до времени есть 2 числовых значения (price/qty)
-    - числовые значения допускают хвосты типа ₽/USDT и т.п. (чистим)
+    Достаём сделки СТРОГО из панели orderHistory:
+    В DevTools это: div[id$='-panel-orderHistory'] и внутри строки,
+    где есть 3 <p data-size="xs">: price, qty, time
     """
     raw: List[Dict[str, Any]] = await page.evaluate(
         """(limit) => {
+          const panel = document.querySelector("[id$='-panel-orderHistory']");
+          if (!panel) return [];
+
           const timeRe = /\\b(\\d{1,2}:\\d{2}(?::\\d{2})?)\\b/;
 
-          const normTime = (s) => {
-            const m = ((s||'').match(timeRe)||[])[1];
-            if (!m) return null;
-            const parts = m.split(':');
-            if (parts.length === 2) {
-              let [hh, mm] = parts;
-              if (hh.length === 1) hh = '0'+hh;
-              return `${hh}:${mm}:00`;
-            }
-            let [hh, mm, ss] = parts;
-            if (hh.length === 1) hh = '0'+hh;
-            if (ss.length === 1) ss = '0'+ss;
-            return `${hh}:${mm}:${ss}`;
-          };
+          // Ищем "строки", которые содержат ровно 3 p[data-size=xs]
+          // и третий p похож на время.
+          const candidates = Array.from(panel.querySelectorAll("div"))
+            .map(div => {
+              const ps = div.querySelectorAll("p[data-size='xs']");
+              if (ps.length !== 3) return null;
+              const p0 = (ps[0].textContent || "").trim();
+              const p1 = (ps[1].textContent || "").trim();
+              const p2 = (ps[2].textContent || "").trim();
+              if (!timeRe.test(p2)) return null;
+              // очень мягкая проверка на число в price/qty
+              if (!/^[0-9]/.test(p0) || !/^[0-9]/.test(p1)) return null;
+              return { price_raw: p0, qty_raw: p1, time_raw: p2 };
+            })
+            .filter(Boolean);
 
-          const cleanNum = (s) => (s||'')
-            .replace(/\\u00A0/g,' ')
-            .replace(/[^0-9\\s.,]/g,'')   // убираем ₽, USDT, буквы и т.п.
-            .trim();
-
-          const isNum = (s) => /^[0-9][0-9\\s.,]*$/.test(cleanNum(s));
-
-          const timeEls = Array.from(document.querySelectorAll('p,span,div'))
-            .filter(e => {
-              const t = (e.textContent||'').trim();
-              return t && t.length <= 22 && timeRe.test(t);
-            });
-
+          // Убираем дубликаты подряд/виртуализацию
           const out = [];
           const seen = new Set();
-
-          for (const te of timeEls) {
-            const tnorm = normTime(te.textContent||'');
-            if (!tnorm) continue;
-
-            let node = te;
-
-            for (let up=0; up<10 && node; up++) {
-              const row = node.closest ? node.closest('div') : null;
-              if (!row) break;
-
-              // собираем короткие “ячейки” в DOM-порядке
-              const cells = [];
-              const walker = document.createTreeWalker(row, NodeFilter.SHOW_ELEMENT, null);
-              let cur = walker.currentNode;
-              while (cur) {
-                const el = cur;
-                const tx = (el.textContent||'').trim();
-                if (tx && tx.length <= 48) cells.push(tx);
-                cur = walker.nextNode();
-              }
-
-              // индекс времени
-              let timeIdx = -1;
-              for (let i=0;i<cells.length;i++){
-                if (normTime(cells[i]) === tnorm) { timeIdx = i; break; }
-              }
-              if (timeIdx < 0) { node = row.parentElement; continue; }
-
-              // два последних числа ДО времени
-              const nums = [];
-              for (let i=0;i<timeIdx;i++){
-                if (isNum(cells[i])) nums.push(cleanNum(cells[i]));
-              }
-              if (nums.length < 2) { node = row.parentElement; continue; }
-
-              const price_raw = nums[nums.length-2];
-              const qty_raw   = nums[nums.length-1];
-
-              const key = `${tnorm}|${price_raw}|${qty_raw}`;
-              if (!seen.has(key)) {
-                seen.add(key);
-                out.push({ trade_time: tnorm, price_raw, qty_raw });
-              }
-              break;
-            }
-
+          for (const r of candidates) {
+            const m = (r.time_raw.match(timeRe) || [])[1];
+            const key = `${m}|${r.price_raw}|${r.qty_raw}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(r);
             if (out.length >= limit) break;
           }
-
-          return out.slice(0, limit);
+          return out;
         }""",
         limit,
     )
 
     rows: List[Dict[str, Any]] = []
+    bad_times: List[Dict[str, str]] = []
+
     for r in raw:
         try:
-            tt = str(r.get("trade_time") or "").strip()
             pr = str(r.get("price_raw") or "").strip()
             qr = str(r.get("qty_raw") or "").strip()
+            tr = str(r.get("time_raw") or "").strip()
 
-            tt = _normalize_time_to_hhmmss(tt) or tt
-            if not tt or not pr or not qr:
+            tt = _normalize_time_to_hhmmss(tr)
+            if not tt:
+                continue
+
+            if not _is_valid_time_hhmmss(tt):
+                bad_times.append({"trade_time": tt, "price_raw": pr, "qty_raw": qr, "time_raw": tr})
                 continue
 
             price = _q8(_to_decimal_num(pr))
@@ -461,7 +423,6 @@ async def extract_trades_anywhere(page: Page, limit: int) -> List[Dict[str, Any]
             if price <= 0 or vol_usdt <= 0 or vol_rub <= 0:
                 continue
 
-            # строго под схему Supabase
             rows.append({
                 "source": SOURCE,
                 "symbol": SYMBOL,
@@ -475,17 +436,18 @@ async def extract_trades_anywhere(page: Page, limit: int) -> List[Dict[str, Any]
         except Exception:
             continue
 
+    # Точная диагностика “49:00:00” и любого другого мусора
+    if bad_times:
+        log.error("Found invalid trade_time values (will be skipped). examples=%s", bad_times[:5])
+
     return rows
 
 async def wait_trades_parsable(page: Page, timeout_ms: int, min_rows: int = 5) -> None:
-    """
-    Ждём не просто “время где-то”, а реальные парсабельные сделки (time + 2 числа).
-    """
     start = time.time()
     last_n = -1
     while (time.time() - start) * 1000 < timeout_ms:
         try:
-            probe = await extract_trades_anywhere(page, limit=50)
+            probe = await extract_trades_order_history(page, limit=50)
             n = len(probe)
             if n != last_n:
                 log.info("Trades parsable probe: %d", n)
@@ -497,7 +459,7 @@ async def wait_trades_parsable(page: Page, timeout_ms: int, min_rows: int = 5) -
         await page.wait_for_timeout(900)
 
     await save_debug(page, "trades_not_parsable")
-    raise RuntimeError("Не дождался парсабельных сделок (time + 2 nums).")
+    raise RuntimeError("Не дождался парсабельных сделок в orderHistory (time + 2 nums).")
 
 # ───────────────────────── SUPABASE ─────────────────────────
 
@@ -525,7 +487,7 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> None:
         log.warning("Supabase env is not fully set; skipping DB write.")
         return
 
-    # upsert по твоему unique index:
+    # upsert по вашему unique index:
     # (source, symbol, trade_time, price, volume_usdt)
     url = (
         SUPABASE_URL.rstrip("/")
@@ -536,6 +498,7 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> None:
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
+        # Можно ignore-duplicates, но merge тоже ок — ключ уникальный.
         "Prefer": "resolution=merge-duplicates,return=minimal",
     }
 
@@ -544,19 +507,12 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> None:
         if resp.status_code in (200, 201, 204):
             log.info("Supabase upsert OK: %s trades", len(rows))
             return
-
-        # иногда Supabase/PostgREST может ругаться на schema cache сразу после миграций
         body = resp.text[:2000]
         log.error("Supabase write failed: %s %s", resp.status_code, body)
 
 # ───────────────────────── CORE ─────────────────────────
 
 async def _goto_stable(page: Page, url: str) -> None:
-    """
-    SPA-устойчивый goto:
-    - domcontentloaded как базовый
-    - networkidle пробуем дополнительно, но не считаем критичным
-    """
     await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
     try:
         await page.wait_for_load_state("networkidle", timeout=20_000)
@@ -635,10 +591,16 @@ async def run_once() -> List[Dict[str, Any]]:
 
             await click_trades_tab_best_effort(page)
 
-            # главное ожидание
+            # Ждём именно “панель сделок” (по id хвосту)
+            try:
+                await page.wait_for_selector("[id$='-panel-orderHistory']", timeout=20_000)
+            except Exception:
+                await save_debug(page, "orderHistory_panel_missing")
+                raise RuntimeError("Не нашёл панель orderHistory: [id$='-panel-orderHistory']")
+
             await wait_trades_parsable(page, timeout_ms=WAIT_TRADES_TIMEOUT_MS, min_rows=5)
 
-            trades = await extract_trades_anywhere(page, limit=LIMIT)
+            trades = await extract_trades_order_history(page, limit=LIMIT)
             log.info("Parsed trades: %d", len(trades))
 
             if len(trades) == 0:
@@ -665,7 +627,6 @@ async def run_once() -> List[Dict[str, Any]]:
                 pass
 
 async def main() -> None:
-    # установка браузеров (если CDN иногда рвёт — ретраи будут дальше)
     ensure_playwright_browsers(force=False)
 
     seen: Dict[TradeKey, float] = {}
