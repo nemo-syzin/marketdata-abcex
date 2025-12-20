@@ -54,11 +54,7 @@ TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}:\d{2})\b")
 _last_install_ts = 0.0
 
 def _playwright_install() -> None:
-    """
-    Runtime-установка браузеров. Это НЕ требует менять команды Render.
-    Ставим и chromium, и chromium-headless-shell, чтобы не ловить ошибку по headless_shell.
-    Защита от бесконечного дерганья install (не чаще раза в 10 минут).
-    """
+
     global _last_install_ts
     now = time.time()
     if now - _last_install_ts < 600:
@@ -92,6 +88,25 @@ def _should_force_install(err: Exception) -> bool:
         or "playwright install" in s
         or "chromium_headless_shell" in s
         or ("ms-playwright" in s and "doesn't exist" in s)
+    )
+
+
+@dataclass(frozen=True)
+class TradeKey:
+    source: str
+    symbol: str
+    trade_time: str
+    price: str
+    volume_usdt: str
+
+
+def trade_key(t: Dict[str, Any]) -> TradeKey:
+    return TradeKey(
+        source=t["source"],
+        symbol=t["symbol"],
+        trade_time=t["trade_time"],
+        price=t["price"],
+        volume_usdt=t["volume_usdt"],
     )
 
 
