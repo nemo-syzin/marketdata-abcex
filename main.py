@@ -37,9 +37,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
 GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))
-WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "25000"))
-
-TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}:\d{2})\b")
+WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "30000"))
 
 # Render cache path
 BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
@@ -53,11 +51,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("abcex")
 
-# ───────────────────────── INSTALL (как в твоём примере) ─────────────────────────
+# ───────────────────────── INSTALL (строго как у тебя) ─────────────────────────
 
 def _env_without_proxies() -> Dict[str, str]:
     """
-    На playwright install убираем прокси — иначе скачивание с CDN часто рвётся.
+    На playwright install убираем прокси — иначе скачивание CDN может рваться.
     """
     env = dict(os.environ)
     for k in [
@@ -81,15 +79,14 @@ def _chromium_exists() -> bool:
 
 def ensure_playwright_browsers(force: bool = False) -> None:
     """
-    Устанавливаем браузеры ПРЯМО как в твоём примере, но через python -m playwright.
-    force=True — игнорируем проверки и ставим заново (если падал launch).
+    Runtime-установка браузеров.
+    Именно: python -m playwright install chromium chromium-headless-shell
     """
     if not force and _chromium_exists() and _headless_shell_exists():
         log.info("Playwright browsers already present.")
         return
 
     log.warning("Installing Playwright browsers (runtime) to %s ... force=%s", BROWSERS_ROOT, force)
-
     r = subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
         check=False,
@@ -101,9 +98,9 @@ def ensure_playwright_browsers(force: bool = False) -> None:
 
     log.warning("playwright install returncode=%s", r.returncode)
     if r.stdout:
-        log.warning("playwright install STDOUT:\n%s", r.stdout[-4000:])
+        log.warning("playwright install STDOUT (tail):\n%s", r.stdout[-4000:])
     if r.stderr:
-        log.warning("playwright install STDERR:\n%s", r.stderr[-4000:])
+        log.warning("playwright install STDERR (tail):\n%s", r.stderr[-4000:])
 
     if r.returncode != 0:
         raise RuntimeError("playwright install failed")
@@ -137,7 +134,9 @@ def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
         out["password"] = u.password
     return out
 
-# ───────────────────────── UTILS (как у тебя) ─────────────────────────
+# ───────────────────────── UTILS ─────────────────────────
+
+TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
 
 def _normalize_num(text: str) -> float:
     t = (text or "").strip().replace("\xa0", " ").replace(" ", "")
@@ -147,20 +146,21 @@ def _normalize_num(text: str) -> float:
         t = t.replace(",", ".")
     return float(t)
 
-
-def _looks_like_time(s: str) -> bool:
-    return bool(re.fullmatch(r"\d{2}:\d{2}:\d{2}", (s or "").strip()))
-
-
 def _extract_time(text: str) -> Optional[str]:
     m = TIME_RE.search((text or "").replace("\xa0", " "))
     if not m:
         return None
-    hh, mm, ss = m.group(1).split(":")
+    raw = m.group(1)
+    parts = raw.split(":")
+    if len(parts) == 2:
+        hh, mm = parts
+        if len(hh) == 1:
+            hh = "0" + hh
+        return f"{hh}:{mm}:00"
+    hh, mm, ss = parts
     if len(hh) == 1:
         hh = "0" + hh
     return f"{hh}:{mm}:{ss}"
-
 
 def _trade_time_to_iso_moscow(hhmmss: str) -> str:
     now = datetime.utcnow() + timedelta(hours=3)
@@ -170,11 +170,31 @@ def _trade_time_to_iso_moscow(hhmmss: str) -> str:
         dt -= timedelta(days=1)
     return dt.isoformat()
 
+async def save_debug(page: Page, tag: str) -> None:
+    """
+    Сохраняем скрин и html. На Render их можно посмотреть через Shell.
+    """
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    png = f"debug_{tag}_{ts}.png"
+    html = f"debug_{tag}_{ts}.html"
+    try:
+        await page.screenshot(path=png, full_page=True)
+        log.warning("Saved debug screenshot: %s", png)
+    except Exception as e:
+        log.warning("Could not save screenshot: %s", e)
+
+    try:
+        content = await page.content()
+        with open(html, "w", encoding="utf-8") as f:
+            f.write(content)
+        log.warning("Saved debug html: %s", html)
+    except Exception as e:
+        log.warning("Could not save html: %s", e)
+
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
-    candidates = ["Принять", "Согласен", "Я согласен", "Accept", "I agree"]
-    for txt in candidates:
+    for txt in ["Принять", "Согласен", "Я согласен", "Accept", "I agree"]:
         try:
             btn = page.locator(f"text={txt}")
             if await btn.count() > 0 and await btn.first.is_visible():
@@ -184,7 +204,6 @@ async def accept_cookies_if_any(page: Page) -> None:
                 return
         except Exception:
             pass
-
 
 async def _find_visible_in_frames(page: Page, selectors: List[str]) -> Optional[Locator]:
     for fr in page.frames:
@@ -202,7 +221,6 @@ async def _find_visible_in_frames(page: Page, selectors: List[str]) -> Optional[
                 continue
     return None
 
-
 async def _is_login_visible(page: Page) -> bool:
     pw = await _find_visible_in_frames(page, [
         "input[type='password']",
@@ -211,37 +229,33 @@ async def _is_login_visible(page: Page) -> bool:
     ])
     return pw is not None
 
-
 async def _open_login_modal_if_needed(page: Page) -> None:
     if await _is_login_visible(page):
         return
-
-    candidates = [
+    for sel in [
         "text=Войти", "text=Login", "text=Sign in",
         "a:has-text('Войти')", "button:has-text('Войти')",
         "button:has-text('Login')", "button:has-text('Sign in')",
-    ]
-    for sel in candidates:
+    ]:
         try:
             btn = page.locator(sel)
             if await btn.count() > 0 and await btn.first.is_visible():
                 await btn.first.click(timeout=7_000)
-                await page.wait_for_timeout(600)
-                break
+                await page.wait_for_timeout(700)
+                return
         except Exception:
             pass
-
 
 async def login_if_needed(page: Page, email: str, password: str) -> None:
     await _open_login_modal_if_needed(page)
 
     if not await _is_login_visible(page):
-        log.info("Login not required (already in session).")
+        log.info("Login not required (no password field detected).")
         return
 
     log.info("Login detected. Performing sign-in ...")
 
-    email_candidates = [
+    email_loc = await _find_visible_in_frames(page, [
         "input[type='email']",
         "input[name='email']",
         "input[name*='mail' i]",
@@ -249,240 +263,213 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
         "input[placeholder*='email' i]",
         "input[placeholder*='почта' i]",
         "input[autocomplete='username']",
-        "input[type='text'][placeholder*='mail' i]",
-        "input[type='text'][placeholder*='email' i]",
         "input[type='text'][name*='login' i]",
-    ]
-    pw_candidates = [
+    ])
+    pw_loc = await _find_visible_in_frames(page, [
         "input[type='password']",
         "input[autocomplete='current-password']",
         "input[name*='pass' i]",
-    ]
+    ])
 
-    email_loc = await _find_visible_in_frames(page, email_candidates)
-    pw_loc = await _find_visible_in_frames(page, pw_candidates)
     if email_loc is None or pw_loc is None:
+        await save_debug(page, "login_fields_not_found")
         raise RuntimeError("Не смог найти поля email/password.")
 
     await email_loc.fill(email, timeout=10_000)
     await pw_loc.fill(password, timeout=10_000)
 
-    btn_candidates = [
+    btn = await _find_visible_in_frames(page, [
         "button:has-text('Войти')",
         "button:has-text('Вход')",
         "button:has-text('Sign in')",
         "button:has-text('Login')",
         "button[type='submit']",
-    ]
-    clicked = False
-    btn = await _find_visible_in_frames(page, btn_candidates)
+    ])
     if btn is not None:
         try:
             await btn.click(timeout=10_000)
-            clicked = True
         except Exception:
-            pass
-
-    if not clicked:
+            try:
+                await page.keyboard.press("Enter")
+            except Exception:
+                pass
+    else:
         try:
             await page.keyboard.press("Enter")
         except Exception:
             pass
 
     await page.wait_for_timeout(800)
-
-    for _ in range(30):
+    for _ in range(40):
         if not await _is_login_visible(page):
             log.info("Login successful (password field disappeared).")
             return
         await page.wait_for_timeout(400)
 
-    raise RuntimeError("Логин не прошёл (форма логина всё ещё видна). Возможны 2FA/капча/иной флоу.")
-
-# ───────────────────────── NAV/WAIT ─────────────────────────
+    await save_debug(page, "login_failed")
+    raise RuntimeError("Логин не прошёл (форма логина всё ещё видна).")
 
 async def click_trades_tab_best_effort(page: Page) -> None:
-    candidates = ["Сделки", "История", "Order history", "Trades", "Последние сделки"]
-    for t in candidates:
+    for t in ["Сделки", "История", "Order history", "Trades", "Последние сделки"]:
         try:
             tab = page.locator(f"[role='tab']:has-text('{t}')")
             if await tab.count() > 0 and await tab.first.is_visible():
                 await tab.first.click(timeout=8_000)
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(600)
                 return
         except Exception:
             continue
-
-    for t in candidates:
+    for t in ["Сделки", "История", "Order history", "Trades", "Последние сделки"]:
         try:
             tab = page.locator(f"text={t}")
             if await tab.count() > 0 and await tab.first.is_visible():
                 await tab.first.click(timeout=8_000)
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(600)
                 return
         except Exception:
             continue
 
-
-async def wait_trades_visible(page: Page, timeout_ms: int = 25_000) -> None:
+async def wait_trades_visible(page: Page, timeout_ms: int) -> None:
+    """
+    Ждём появления времени HH:MM или HH:MM:SS где угодно в DOM.
+    """
     start = time.time()
     while (time.time() - start) * 1000 < timeout_ms:
         try:
             ok = await page.evaluate(
                 """() => {
-                    const re = /^\\d{2}:\\d{2}:\\d{2}$/;
-                    const ps = Array.from(document.querySelectorAll('p'));
-                    return ps.some(p => re.test((p.textContent||'').trim()));
+                    const re = /\\b\\d{1,2}:\\d{2}(?::\\d{2})?\\b/;
+                    const els = Array.from(document.querySelectorAll('p,span,div'));
+                    return els.some(e => {
+                      const t = (e.textContent||'').trim();
+                      return t.length <= 16 && re.test(t);
+                    });
                 }"""
             )
             if ok:
-                log.info("Trades look visible (time cells detected).")
+                log.info("Trades look visible (time tokens detected).")
                 return
         except Exception:
             pass
         await page.wait_for_timeout(800)
 
-    raise RuntimeError("Не дождался появления сделок (HH:MM:SS).")
+    await save_debug(page, "trades_not_visible")
+    raise RuntimeError("Не дождался появления сделок (time tokens).")
 
-# ───────────────────────── PARSING (твой алгоритм, но корень выбираем умнее) ─────────────────────────
+# ───────────────────────── PARSING (НЕ привязано к <p>) ─────────────────────────
 
-async def get_order_history_panel_soft(page: Page) -> Optional[Locator]:
+async def extract_trades_anywhere(page: Page, limit: int) -> List[Dict[str, Any]]:
     """
-    Как у тебя, но без падения: если нет panel-orderHistory — вернём None.
+    Универсальный DOM-парсер:
+    - находим элементы с временем HH:MM(:SS)
+    - для каждого времени берём ближайший “ряд” (ancestor div),
+      и из текстов в DOM-порядке берём 2 числа перед временем (price/qty)
     """
-    panel = page.locator("div[role='tabpanel'][id*='panel-orderHistory']")
-    cnt = await panel.count()
-    if cnt == 0:
-        return None
-    for i in range(cnt):
-        p = panel.nth(i)
-        try:
-            if await p.is_visible():
-                return p
-        except Exception:
-            continue
-    return None
-
-
-async def detect_trades_root_by_pattern(page: Page) -> Optional[Locator]:
-    """
-    Находит корневой контейнер сделок, используя ТВОЙ же паттерн:
-      div, у которого прямые дети p,p,p и третий — HH:MM:SS.
-    Дальше выбираем контейнер (parent) с максимальным количеством таких строк.
-    """
-    await page.evaluate(
-        """() => {
-          // очистим старую метку, если была
-          document.querySelectorAll("[data-abcex-trades-root='1']").forEach(n => n.removeAttribute("data-abcex-trades-root"));
-
-          const isTime = (s) => /^\\d{2}:\\d{2}:\\d{2}$/.test((s||'').trim());
-          const isNum  = (s) => /^[0-9][0-9\\s\\u00A0.,]*$/.test((s||'').trim());
-
-          const rows = [];
-          const divs = Array.from(document.querySelectorAll("div"));
-          for (const g of divs) {
-            const ps = Array.from(g.querySelectorAll(":scope > p"));
-            if (ps.length < 3) continue;
-
-            const t0 = (ps[0].textContent || "").trim();
-            const t1 = (ps[1].textContent || "").trim();
-            const t2 = (ps[2].textContent || "").trim();
-
-            if (!isTime(t2)) continue;
-            if (!isNum(t0) || !isNum(t1)) continue;
-
-            rows.push(g);
-          }
-
-          if (!rows.length) return;
-
-          // считаем “голоса” за контейнеры (parentElement)
-          const score = new Map();
-          for (const r of rows) {
-            const p = r.parentElement;
-            if (!p) continue;
-            score.set(p, (score.get(p) || 0) + 1);
-          }
-
-          let best = null;
-          let bestScore = 0;
-          for (const [node, sc] of score.entries()) {
-            if (sc > bestScore) {
-              best = node;
-              bestScore = sc;
+    raw: List[Dict[str, Any]] = await page.evaluate(
+        """(limit) => {
+          const isTime = (s) => /\\b\\d{1,2}:\\d{2}(?::\\d{2})?\\b/.test((s||'').trim());
+          const normTime = (s) => {
+            const m = ((s||'').match(/\\b(\\d{1,2}:\\d{2}(?::\\d{2})?)\\b/)||[])[1];
+            if (!m) return null;
+            const parts = m.split(':');
+            if (parts.length === 2) {
+              let [hh, mm] = parts;
+              if (hh.length === 1) hh = '0'+hh;
+              return `${hh}:${mm}:00`;
             }
-          }
+            let [hh, mm, ss] = parts;
+            if (hh.length === 1) hh = '0'+hh;
+            return `${hh}:${mm}:${ss}`;
+          };
 
-          if (best && bestScore >= 3) {
-            best.setAttribute("data-abcex-trades-root", "1");
-          }
-        }"""
-    )
-    root = page.locator("[data-abcex-trades-root='1']")
-    if await root.count() > 0 and await root.first.is_visible():
-        return root.first
-    return None
-
-
-async def extract_trades_from_root(root: Locator, limit: int) -> List[Dict[str, Any]]:
-    """
-    Это 1-в-1 твой JS-парсер (p,p,p + time + num), только root может быть не panel-orderHistory.
-    """
-    handle = await root.element_handle()
-    if handle is None:
-        return []
-
-    raw_rows: List[Dict[str, Any]] = await handle.evaluate(
-        """(root, limit) => {
-          const isTime = (s) => /^\\d{2}:\\d{2}:\\d{2}$/.test((s||'').trim());
           const isNum = (s) => /^[0-9][0-9\\s\\u00A0.,]*$/.test((s||'').trim());
 
-          const out = [];
-          const grids = Array.from(root.querySelectorAll('div'));
+          // собираем кандидаты "time elements"
+          const timeEls = Array.from(document.querySelectorAll('p,span,div'))
+            .filter(e => {
+              const t = (e.textContent||'').trim();
+              return t && t.length <= 16 && isTime(t);
+            });
 
-          for (const g of grids) {
-            const ps = Array.from(g.querySelectorAll(':scope > p'));
-            if (ps.length < 3) continue;
+          const rows = [];
+          const seen = new Set();
 
-            const t0 = (ps[0].textContent || '').trim();
-            const t1 = (ps[1].textContent || '').trim();
-            const t2 = (ps[2].textContent || '').trim();
+          for (const te of timeEls) {
+            // поднимаемся вверх: ищем div-ряд, где есть хотя бы 2 числа + время
+            let node = te;
+            for (let up = 0; up < 8 && node; up++) {
+              const cand = node.closest ? node.closest('div') : null;
+              if (!cand) break;
+              node = cand.parentElement;
 
-            if (!isTime(t2)) continue;
-            if (!isNum(t0) || !isNum(t1)) continue;
+              const texts = [];
+              const walker = document.createTreeWalker(cand, NodeFilter.SHOW_ELEMENT, null);
+              let cur = walker.currentNode;
+              while (cur) {
+                const el = cur;
+                const tx = (el.textContent||'').trim();
+                // берем только короткие "ячейки", чтобы не схватить весь блок
+                if (tx && tx.length <= 32) texts.push(tx);
+                cur = walker.nextNode();
+              }
 
-            const style0 = (ps[0].getAttribute('style') || '').toLowerCase();
+              const tnorm = normTime(te.textContent||'');
+              if (!tnorm) continue;
 
-            let side = null;
-            if (style0.includes('green')) side = 'buy';
-            if (style0.includes('red')) side = 'sell';
+              // найдём позицию времени и 2 числа перед ним
+              let timeIdx = -1;
+              for (let i = 0; i < texts.length; i++) {
+                if (normTime(texts[i]) === tnorm) { timeIdx = i; break; }
+              }
+              if (timeIdx < 0) continue;
 
-            out.push({ price_raw: t0, qty_raw: t1, time: t2, side });
-            if (out.length >= limit) break;
+              // собираем числовые токены до времени
+              const nums = [];
+              for (let i = 0; i < timeIdx; i++) {
+                const s = texts[i].replace(/\\u00A0/g,' ').trim();
+                if (isNum(s)) nums.push(s);
+              }
+              if (nums.length < 2) continue;
+
+              const price_raw = nums[nums.length - 2];
+              const qty_raw = nums[nums.length - 1];
+
+              // side по стилю: ищем элемент, чья textContent == price_raw
+              let side = null;
+              const priceEl = Array.from(cand.querySelectorAll('*')).find(x => (x.textContent||'').trim() === price_raw);
+              if (priceEl) {
+                const st = (priceEl.getAttribute('style') || '').toLowerCase();
+                if (st.includes('green')) side = 'buy';
+                if (st.includes('red')) side = 'sell';
+              }
+
+              const key = `${tnorm}|${price_raw}|${qty_raw}`;
+              if (seen.has(key)) break;
+              seen.add(key);
+
+              rows.push({ time: tnorm, price_raw, qty_raw, side });
+              break;
+            }
+
+            if (rows.length >= limit) break;
           }
 
-          return out;
+          return rows.slice(0, limit);
         }""",
         limit,
     )
 
     trades: List[Dict[str, Any]] = []
-    for r in raw_rows:
+    for r in raw:
         try:
             price_raw = str(r.get("price_raw", "")).strip()
             qty_raw = str(r.get("qty_raw", "")).strip()
-            time_txt = str(r.get("time", "")).strip()
+            tt = str(r.get("time", "")).strip()
             side = r.get("side", None)
-
-            if not price_raw or not qty_raw or not time_txt:
-                continue
-            if not _looks_like_time(time_txt):
-                continue
 
             price = _normalize_num(price_raw)
             qty = _normalize_num(qty_raw)
 
-            tt = _extract_time(time_txt) or time_txt
             trade_time_iso = _trade_time_to_iso_moscow(tt)
 
             trades.append(
@@ -515,7 +502,6 @@ class TradeKey:
     price: str
     volume_usdt: str
 
-
 def trade_key(t: Dict[str, Any]) -> TradeKey:
     return TradeKey(
         source=str(t.get("source", "")),
@@ -524,7 +510,6 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
         price=str(t.get("price", "")),
         volume_usdt=str(t.get("volume_usdt", "")),
     )
-
 
 async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> None:
     if not rows:
@@ -611,9 +596,7 @@ async def run_once() -> List[Dict[str, Any]]:
                 raise RuntimeError("ABCEX_EMAIL/ABCEX_PASSWORD must be set in env.")
             await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
 
-            # Ключевой момент для Render:
-            # после логина сайт иногда уводит на /client/spot (без пары).
-            # Поэтому ещё раз жёстко открываем нужную пару.
+            # После логина сайт иногда уводит на /client/spot без пары — фиксируем.
             await page.goto(ABCEX_URL, wait_until="networkidle", timeout=GOTO_TIMEOUT_MS)
             await page.wait_for_timeout(1200)
 
@@ -626,24 +609,13 @@ async def run_once() -> List[Dict[str, Any]]:
             await click_trades_tab_best_effort(page)
             await wait_trades_visible(page, timeout_ms=WAIT_TRADES_TIMEOUT_MS)
 
-            # 1) сначала пробуем ровно как в локальном (panel-orderHistory)
-            panel = await get_order_history_panel_soft(page)
-            if panel is not None:
-                trades = await extract_trades_from_root(panel, limit=LIMIT)
-                if trades:
-                    log.info("Parsed %d trades from panel-orderHistory", len(trades))
-                    return trades
+            trades = await extract_trades_anywhere(page, limit=LIMIT)
 
-            # 2) если панели нет/пусто — ищем корень по твоему паттерну
-            root = await detect_trades_root_by_pattern(page)
-            if root is None:
-                raise RuntimeError("Не смог определить корневой контейнер сделок по DOM-паттерну.")
+            log.info("Parsed trades: %d", len(trades))
+            if len(trades) == 0:
+                # Это ключевой момент: если 0, сохраняем артефакты
+                await save_debug(page, "parsed_zero_trades")
 
-            trades = await extract_trades_from_root(root, limit=LIMIT)
-            if not trades:
-                raise RuntimeError("Корень сделок найден, но сделки не распарсились (0 rows).")
-
-            log.info("Parsed %d trades from detected root", len(trades))
             return trades
 
         finally:
@@ -662,7 +634,6 @@ async def run_once() -> List[Dict[str, Any]]:
 
 
 async def main() -> None:
-    # 1) браузеры (как в твоём примере)
     ensure_playwright_browsers(force=False)
 
     seen: Dict[TradeKey, float] = {}
