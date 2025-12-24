@@ -11,13 +11,13 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import httpx
-from playwright.async_api import async_playwright, Browser, BrowserContext, Frame, Locator, Page
+from playwright.async_api import async_playwright, Page
 
 # ───────────────────────── CONFIG ─────────────────────────
 
@@ -28,7 +28,7 @@ SOURCE = os.getenv("SOURCE", "abcex")
 SYMBOL = os.getenv("SYMBOL", "USDT/RUB")
 
 LIMIT = int(os.getenv("LIMIT", "120"))
-POLL_SEC = float(os.getenv("POLL_SEC", "5.0"))
+POLL_SEC = float(os.getenv("POLL_SEC", "2.0"))
 
 ABCEX_EMAIL = os.getenv("ABCEX_EMAIL", "")
 ABCEX_PASSWORD = os.getenv("ABCEX_PASSWORD", "")
@@ -37,15 +37,23 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "120000"))
-WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "70000"))
+GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))
+WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "45000"))
 
+# Защита от мусора: допустимый диапазон цены (настрой через ENV при необходимости)
+PRICE_MIN = Decimal(os.getenv("PRICE_MIN", "50"))   # для USDT/RUB разумно 50
+PRICE_MAX = Decimal(os.getenv("PRICE_MAX", "200"))  # для USDT/RUB разумно 200
+
+# Render cache path
 BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
 
 # ───────────────────────── LOGGING ─────────────────────────
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+)
 log = logging.getLogger("abcex")
 
 # ───────────────────────── INSTALL ─────────────────────────
@@ -75,7 +83,10 @@ def ensure_playwright_browsers(force: bool = False) -> None:
 
     max_attempts = 4
     for attempt in range(1, max_attempts + 1):
-        log.warning("Installing Playwright browsers to %s (attempt %s/%s) ...", BROWSERS_ROOT, attempt, max_attempts)
+        log.warning(
+            "Installing Playwright browsers (runtime) to %s ... force=%s attempt=%s/%s",
+            BROWSERS_ROOT, force, attempt, max_attempts
+        )
         r = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
             check=False,
@@ -86,9 +97,9 @@ def ensure_playwright_browsers(force: bool = False) -> None:
         )
         log.warning("playwright install returncode=%s", r.returncode)
         if r.stdout:
-            log.warning("playwright install STDOUT (tail):\n%s", r.stdout[-2500:])
+            log.warning("playwright install STDOUT (tail):\n%s", r.stdout[-2000:])
         if r.stderr:
-            log.warning("playwright install STDERR (tail):\n%s", r.stderr[-2500:])
+            log.warning("playwright install STDERR (tail):\n%s", r.stderr[-2000:])
 
         if r.returncode == 0 and _chromium_exists() and _headless_shell_exists():
             log.warning("Install verification: chromium=True headless_shell=True")
@@ -96,7 +107,7 @@ def ensure_playwright_browsers(force: bool = False) -> None:
 
         if attempt < max_attempts:
             sleep_s = 6 * attempt
-            log.warning("Install not complete, sleeping %ss...", sleep_s)
+            log.warning("Install not complete yet. Sleeping %ss and retrying...", sleep_s)
             time.sleep(sleep_s)
 
     raise RuntimeError("playwright install failed after retries")
@@ -129,18 +140,24 @@ def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
 # ───────────────────────── NUMBERS / TIME ─────────────────────────
 
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
-STRICT_TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$")
+STRICT_TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$")  # 00:00:00 .. 23:59:59
 
 def _q8(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
 
 def _to_decimal_num(text: str) -> Decimal:
+    """
+    Грязестойкий парсер чисел:
+    - убирает валюты/буквы/символы типа ₽, USDT
+    - поддерживает '191 889,47' / '191889.47' / '14,964.9824'
+    """
     t = (text or "").strip().replace("\xa0", " ")
     t = re.sub(r"[^0-9\s\.,]", "", t)
     t = t.replace(" ", "")
     if not t:
         raise InvalidOperation("empty numeric")
     if "," in t and "." in t:
+        # если есть и "," и ".", почти всегда "," = тысячные
         t = t.replace(",", "")
     else:
         t = t.replace(",", ".")
@@ -161,16 +178,19 @@ def _normalize_time_to_hhmmss(text: str) -> Optional[str]:
 def _is_valid_time_hhmmss(tt: str) -> bool:
     return bool(tt and STRICT_TIME_RE.match(tt))
 
+def _price_ok(p: Decimal) -> bool:
+    return (p >= PRICE_MIN) and (p <= PRICE_MAX)
+
 # ───────────────────────── DEBUG ARTIFACTS ─────────────────────────
 
-_last_zero_debug_ts = 0.0
-
 async def save_debug(page: Page, tag: str) -> None:
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     png = f"debug_{tag}_{ts}.png"
     html = f"debug_{tag}_{ts}.html"
+
     try:
-        await page.screenshot(path=png, full_page=False, timeout=5_000)
+        # уменьшаем шанс таймаута на шрифтах
+        await page.screenshot(path=png, full_page=False, timeout=8_000)
         log.warning("Saved debug screenshot: %s", png)
     except Exception as e:
         log.warning("Could not save screenshot: %s", e)
@@ -197,29 +217,13 @@ async def accept_cookies_if_any(page: Page) -> None:
         except Exception:
             pass
 
-async def _find_visible_in_frames(page: Page, selectors: List[str]) -> Optional[Locator]:
-    for fr in page.frames:
-        for sel in selectors:
-            try:
-                loc = fr.locator(sel)
-                cnt = await loc.count()
-                if cnt <= 0:
-                    continue
-                for i in range(min(cnt, 10)):
-                    cand = loc.nth(i)
-                    if await cand.is_visible():
-                        return cand
-            except Exception:
-                continue
-    return None
-
 async def _is_login_visible(page: Page) -> bool:
-    pw = await _find_visible_in_frames(page, [
-        "input[type='password']",
-        "input[autocomplete='current-password']",
-        "input[name*='pass' i]",
-    ])
-    return pw is not None
+    # проще и надежнее: достаточно увидеть input[type=password] хоть где-то
+    try:
+        pw = page.locator("input[type='password']")
+        return (await pw.count() > 0) and (await pw.first.is_visible())
+    except Exception:
+        return False
 
 async def _open_login_modal_if_needed(page: Page) -> None:
     if await _is_login_visible(page):
@@ -239,7 +243,7 @@ async def _open_login_modal_if_needed(page: Page) -> None:
             btn = page.locator(sel)
             if await btn.count() > 0 and await btn.first.is_visible():
                 await btn.first.click(timeout=7_000)
-                await page.wait_for_timeout(900)
+                await page.wait_for_timeout(800)
                 return
         except Exception:
             pass
@@ -252,56 +256,34 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
         return
 
     if not email or not password:
-        await save_debug(page, "login_required_no_creds")
-        raise RuntimeError("Login required but ABCEX_EMAIL/ABCEX_PASSWORD are not set.")
+        raise RuntimeError("Login form detected, but ABCEX_EMAIL/ABCEX_PASSWORD are not set.")
 
     log.info("Login detected. Performing sign-in ...")
 
-    email_loc = await _find_visible_in_frames(page, [
-        "input[type='email']",
-        "input[name='email']",
-        "input[name*='mail' i]",
-        "input[placeholder*='mail' i]",
-        "input[placeholder*='email' i]",
-        "input[placeholder*='почта' i]",
-        "input[autocomplete='username']",
-        "input[type='text'][name*='login' i]",
-    ])
-    pw_loc = await _find_visible_in_frames(page, [
-        "input[type='password']",
-        "input[autocomplete='current-password']",
-        "input[name*='pass' i]",
-    ])
+    # email field: берём первый видимый input email/text
+    email_loc = page.locator("input[type='email'], input[autocomplete='username'], input[name*='mail' i], input[name*='login' i]").first
+    pw_loc = page.locator("input[type='password'], input[autocomplete='current-password']").first
 
-    if email_loc is None or pw_loc is None:
-        await save_debug(page, "login_fields_not_found")
-        raise RuntimeError("Не смог найти поля email/password.")
+    if not await email_loc.is_visible() or not await pw_loc.is_visible():
+        await save_debug(page, "login_fields_not_visible")
+        raise RuntimeError("Не смог найти/увидеть поля email/password.")
 
     await email_loc.fill(email, timeout=10_000)
     await pw_loc.fill(password, timeout=10_000)
 
-    btn = await _find_visible_in_frames(page, [
-        "button:has-text('Войти')",
-        "button:has-text('Вход')",
-        "button:has-text('Sign in')",
-        "button:has-text('Login')",
-        "button[type='submit']",
-    ])
-    if btn is not None:
-        try:
-            await btn.click(timeout=10_000)
-        except Exception:
-            try:
-                await page.keyboard.press("Enter")
-            except Exception:
-                pass
-    else:
+    submit = page.locator("button[type='submit'], button:has-text('Войти'), button:has-text('Login'), button:has-text('Sign in')").first
+    try:
+        if await submit.is_visible():
+            await submit.click(timeout=10_000)
+        else:
+            await page.keyboard.press("Enter")
+    except Exception:
         try:
             await page.keyboard.press("Enter")
         except Exception:
             pass
 
-    await page.wait_for_timeout(900)
+    await page.wait_for_timeout(1_000)
 
     for _ in range(60):
         if not await _is_login_visible(page):
@@ -313,180 +295,182 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
     raise RuntimeError("Логин не прошёл (форма логина всё ещё видна).")
 
 async def click_trades_tab_best_effort(page: Page) -> None:
-    # Мы не знаем точную разметку, поэтому просто стараемся ткнуть всё похожее.
-    candidates = ["Сделки", "История", "Order history", "Trades", "Последние сделки", "Trade history"]
+    # пробуем вкладки/кнопки “Сделки/Trades/Order history”
+    candidates = ["Сделки", "Trades", "Order history", "История", "Последние сделки"]
     for t in candidates:
-        for sel in [f"[role='tab']:has-text('{t}')", f"button:has-text('{t}')", f"a:has-text('{t}')", f"text={t}"]:
+        for sel in [
+            f"[role='tab']:has-text('{t}')",
+            f"button:has-text('{t}')",
+            f"a:has-text('{t}')",
+            f"text={t}",
+        ]:
             try:
-                tab = page.locator(sel)
-                if await tab.count() > 0 and await tab.first.is_visible():
-                    await tab.first.click(timeout=8_000)
-                    await page.wait_for_timeout(900)
+                el = page.locator(sel).first
+                if await el.count() > 0 and await el.is_visible():
+                    await el.click(timeout=8_000)
+                    await page.wait_for_timeout(800)
                     return
             except Exception:
                 continue
 
-# ───────────────────────── FIND & PARSE (ROBUST) ─────────────────────────
+# ───────────────────────── PARSING ─────────────────────────
 
-async def _eval_find_trades(frame: Frame, limit: int) -> List[Dict[str, str]]:
+async def _extract_raw_trade_triplets(page: Page, limit: int) -> List[Dict[str, str]]:
     """
-    Универсальный парсер:
-    1) если найден panel [id$='-panel-orderHistory'] — используем его
-    2) иначе ищем по всему документу "строки" с 3 p[data-size='xs'] и третье похоже на время,
-       затем берём самый "плотный" контейнер (где таких строк больше всего)
+    Достаём "триплеты" из активной панели: два числа + время.
+    Не привязываемся к id orderHistory — потому что он ломается.
     """
-    return await frame.evaluate(
-        """(limit) => {
-          const timeRe = /\\b(\\d{1,2}:\\d{2}(?::\\d{2})?)\\b/;
+    js = r"""
+    (limit) => {
+      const timeRe = /\b(\d{1,2}:\d{2}(?::\d{2})?)\b/;
 
-          function collectFrom(root) {
-            const candidates = Array.from(root.querySelectorAll("div"))
-              .map(div => {
-                const ps = div.querySelectorAll("p[data-size='xs']");
-                if (ps.length !== 3) return null;
-                const p0 = (ps[0].textContent || "").trim();
-                const p1 = (ps[1].textContent || "").trim();
-                const p2 = (ps[2].textContent || "").trim();
-                if (!timeRe.test(p2)) return null;
-                if (!/^[0-9]/.test(p0) || !/^[0-9]/.test(p1)) return null;
-                return { rowEl: div, price_raw: p0, qty_raw: p1, time_raw: p2 };
-              })
-              .filter(Boolean);
+      const pickRoot = () => {
+        const roots = [
+          document.querySelector("[role='tabpanel'][data-state='active']"),
+          document.querySelector("[role='tabpanel']:not([hidden])"),
+          document.querySelector("[role='tabpanel']"),
+          document.querySelector("main"),
+          document.body
+        ].filter(Boolean);
+        return roots[0] || document.body;
+      };
 
-            // дедуп по (time|price|qty)
-            const out = [];
-            const seen = new Set();
-            for (const r of candidates) {
-              const m = (r.time_raw.match(timeRe) || [])[1];
-              const key = `${m}|${r.price_raw}|${r.qty_raw}`;
-              if (seen.has(key)) continue;
-              seen.add(key);
-              out.push({ price_raw: r.price_raw, qty_raw: r.qty_raw, time_raw: r.time_raw, _parent: r.rowEl.parentElement });
-              if (out.length >= limit) break;
-            }
-            return out;
+      const root = pickRoot();
+
+      // Находим div, внутри которых есть p[data-size=xs] (как в твоей версии),
+      // но НЕ предполагаем порядок: время может быть в любом из 3.
+      const nodes = Array.from(root.querySelectorAll("div"))
+        .map(div => {
+          const ps = div.querySelectorAll("p[data-size='xs']");
+          if (!ps || ps.length < 3) return null;
+
+          // берём первые 3, но если их больше — всё равно часто первые три являются строкой
+          const texts = Array.from(ps).slice(0, 4).map(p => (p.textContent || "").trim()).filter(Boolean);
+          if (texts.length < 3) return null;
+
+          // ищем любую комбинацию: одно поле время, два поля начинаются с цифры
+          for (let i = 0; i < texts.length; i++) {
+            if (!timeRe.test(texts[i])) continue;
+            const timeTxt = (texts[i].match(timeRe) || [])[1];
+            const nums = texts.filter((_, idx) => idx !== i);
+            // оставляем только те, что похожи на числа
+            const numLike = nums.filter(x => /^[0-9]/.test(x));
+            if (numLike.length < 2) continue;
+            return { a: numLike[0], b: numLike[1], time_raw: timeTxt };
           }
+          return null;
+        })
+        .filter(Boolean);
 
-          const panel = document.querySelector("[id$='-panel-orderHistory']");
-          if (panel) {
-            return collectFrom(panel);
-          }
-
-          // fallback: сбор по всему документу
-          const all = collectFrom(document);
-          if (all.length === 0) return [];
-
-          // выбираем контейнер, в котором таких строк максимальное число
-          const counts = new Map();
-          for (const r of all) {
-            const p = r._parent;
-            if (!p) continue;
-            counts.set(p, (counts.get(p) || 0) + 1);
-          }
-          let best = null;
-          let bestN = 0;
-          for (const [p, n] of counts.entries()) {
-            if (n > bestN) { bestN = n; best = p; }
-          }
-
-          if (!best || bestN < 5) {
-            // если не нашли "плотный" контейнер — просто отдаём all
-            return all.map(({price_raw, qty_raw, time_raw}) => ({price_raw, qty_raw, time_raw}));
-          }
-
-          // фильтруем строки только внутри best-контейнера
-          const filtered = [];
-          const seen2 = new Set();
-          for (const r of all) {
-            if (r._parent !== best) continue;
-            const m = (r.time_raw.match(timeRe) || [])[1];
-            const key = `${m}|${r.price_raw}|${r.qty_raw}`;
-            if (seen2.has(key)) continue;
-            seen2.add(key);
-            filtered.push({price_raw: r.price_raw, qty_raw: r.qty_raw, time_raw: r.time_raw});
-            if (filtered.length >= limit) break;
-          }
-          return filtered;
-        }""",
-        limit,
-    )
-
-async def extract_trades_any_frame(page: Page, limit: int) -> Tuple[List[Dict[str, Any]], str]:
+      // дедуп + лимит
+      const out = [];
+      const seen = new Set();
+      for (const r of nodes) {
+        const key = `${r.time_raw}|${r.a}|${r.b}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(r);
+        if (out.length >= limit) break;
+      }
+      return out;
+    }
     """
-    Ищем сделки во всех frames. Возвращаем (rows, frame_url).
+    return await page.evaluate(js, limit)
+
+def _try_parse_trade(a: str, b: str, time_raw: str) -> Optional[Tuple[Decimal, Decimal, str]]:
     """
-    bad_times: List[Dict[str, str]] = []
-    for fr in page.frames:
+    Возвращаем (price, vol_usdt, hh:mm:ss) либо None.
+    Порядок (a,b) может быть (price, qty) или (qty, price) — выбираем по sanity диапазону цены.
+    """
+    tt = _normalize_time_to_hhmmss(time_raw)
+    if not tt or not _is_valid_time_hhmmss(tt):
+        return None
+
+    def parse_pair(p_txt: str, q_txt: str) -> Optional[Tuple[Decimal, Decimal]]:
         try:
-            raw = await _eval_find_trades(fr, limit)
-            if not raw or len(raw) < 3:
-                continue
-
-            rows: List[Dict[str, Any]] = []
-            for r in raw:
-                try:
-                    pr = str(r.get("price_raw") or "").strip()
-                    qr = str(r.get("qty_raw") or "").strip()
-                    tr = str(r.get("time_raw") or "").strip()
-
-                    tt = _normalize_time_to_hhmmss(tr)
-                    if not tt:
-                        continue
-
-                    if not _is_valid_time_hhmmss(tt):
-                        bad_times.append({"trade_time": tt, "price_raw": pr, "qty_raw": qr, "time_raw": tr})
-                        continue
-
-                    price = _q8(_to_decimal_num(pr))
-                    vol_usdt = _q8(_to_decimal_num(qr))
-                    vol_rub = _q8(price * vol_usdt)
-
-                    if price <= 0 or vol_usdt <= 0 or vol_rub <= 0:
-                        continue
-
-                    rows.append({
-                        "source": SOURCE,
-                        "symbol": SYMBOL,
-                        "price": str(price),
-                        "volume_usdt": str(vol_usdt),
-                        "volume_rub": str(vol_rub),
-                        "trade_time": tt,
-                    })
-                except (InvalidOperation, ValueError):
-                    continue
-                except Exception:
-                    continue
-
-            if bad_times:
-                log.error("Invalid trade_time examples (skipping): %s", bad_times[:5])
-
-            if rows:
-                return rows, (fr.url or "unknown-frame")
+            p = _q8(_to_decimal_num(p_txt))
+            q = _q8(_to_decimal_num(q_txt))
+            if p <= 0 or q <= 0:
+                return None
+            return p, q
         except Exception:
+            return None
+
+    # 1) прямой порядок
+    r1 = parse_pair(a, b)
+    if r1 and _price_ok(r1[0]):
+        return r1[0], r1[1], tt
+
+    # 2) обратный порядок
+    r2 = parse_pair(b, a)
+    if r2 and _price_ok(r2[0]):
+        return r2[0], r2[1], tt
+
+    # 3) иногда UI отдаёт "цену" со сдвигом (например, *1000) — пробуем нормализацию
+    #    НО применяем только если после деления цена попадает в диапазон.
+    for base in (r1, r2):
+        if not base:
+            continue
+        p, q = base
+        if p > PRICE_MAX:
+            for div in (Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")):
+                pp = p / div
+                if _price_ok(pp):
+                    return _q8(pp), q, tt
+
+    return None
+
+async def extract_trades(page: Page, limit: int) -> List[Dict[str, Any]]:
+    raw = await _extract_raw_trade_triplets(page, limit=limit)
+
+    rows: List[Dict[str, Any]] = []
+    rejected = 0
+
+    for r in raw:
+        a = str(r.get("a") or "").strip()
+        b = str(r.get("b") or "").strip()
+        tr = str(r.get("time_raw") or "").strip()
+
+        parsed = _try_parse_trade(a, b, tr)
+        if not parsed:
+            rejected += 1
             continue
 
-    return [], "no-frame"
+        price, vol_usdt, tt = parsed
+        vol_rub = _q8(price * vol_usdt)
 
-async def wait_trades_parsable_any_frame(page: Page, timeout_ms: int, min_rows: int = 5) -> str:
+        rows.append({
+            "source": SOURCE,
+            "symbol": SYMBOL,
+            "price": str(price),
+            "volume_usdt": str(vol_usdt),
+            "volume_rub": str(vol_rub),
+            "trade_time": tt,
+        })
+
+    if rejected:
+        log.info("Rejected rows (failed sanity/parse): %s", rejected)
+
+    return rows
+
+async def wait_trades_parsable(page: Page, timeout_ms: int, min_rows: int = 5) -> None:
     start = time.time()
     last_n = -1
-    last_frame = "no-frame"
     while (time.time() - start) * 1000 < timeout_ms:
         try:
-            rows, fr_url = await extract_trades_any_frame(page, limit=50)
-            n = len(rows)
-            last_frame = fr_url
+            probe = await extract_trades(page, limit=50)
+            n = len(probe)
             if n != last_n:
-                log.info("Trades parsable probe: %d (frame=%s)", n, fr_url)
+                log.info("Trades parsable probe: %d", n)
                 last_n = n
             if n >= min_rows:
-                return fr_url
+                return
         except Exception:
             pass
         await page.wait_for_timeout(900)
 
-    await save_debug(page, "trades_not_parsable_any_frame")
-    raise RuntimeError("Не дождался парсабельных сделок (fallback any-frame).")
+    await save_debug(page, "trades_not_parsable")
+    raise RuntimeError("Не дождался парсабельных сделок (time + 2 numbers) в активной панели.")
 
 # ───────────────────────── SUPABASE ─────────────────────────
 
@@ -507,7 +491,7 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
         volume_usdt=str(t.get("volume_usdt", "")),
     )
 
-async def supabase_upsert_trades(rows: List[Dict[str, Any]], client: httpx.AsyncClient) -> None:
+async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
     if not SUPABASE_URL or not SUPABASE_KEY or not SUPABASE_TABLE:
@@ -526,44 +510,36 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]], client: httpx.Async
         "Prefer": "resolution=merge-duplicates,return=minimal",
     }
 
-    resp = await client.post(url, headers=headers, content=json.dumps(rows, ensure_ascii=False).encode("utf-8"))
-    if resp.status_code in (200, 201, 204):
-        log.info("Supabase upsert OK: %s trades", len(rows))
-        return
+    async with httpx.AsyncClient(timeout=35.0, headers=headers, trust_env=True) as client:
+        resp = await client.post(url, content=json.dumps(rows, ensure_ascii=False).encode("utf-8"))
+        if resp.status_code in (200, 201, 204):
+            log.info("Supabase upsert OK: %s trades", len(rows))
+            return
+        log.error("Supabase write failed: %s %s", resp.status_code, resp.text[:2000])
 
-    log.error("Supabase write failed: %s %s", resp.status_code, resp.text[:2000])
-
-# ───────────────────────── NAVIGATION ─────────────────────────
+# ───────────────────────── CORE ─────────────────────────
 
 async def _goto_stable(page: Page, url: str) -> None:
-    last_err: Optional[Exception] = None
-    for attempt in range(1, 4):
+    # Playwright иногда “подвисает” на goto — добавим fallback reload
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+    except Exception as e:
+        log.warning("goto failed (%s). retry with reload...", e)
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
-            await page.wait_for_timeout(1200)
-            return
-        except Exception as e:
-            last_err = e
-            log.warning("goto attempt %s/3 failed: %s", attempt, e)
-            await page.wait_for_timeout(1500 * attempt)
-    raise last_err or RuntimeError("goto failed")
+            await page.reload(wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+        except Exception:
+            raise
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20_000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(1_200)
 
-# ───────────────────────── SESSION (REUSE) ─────────────────────────
+async def run_once() -> List[Dict[str, Any]]:
+    proxy_url = _get_proxy_url()
+    pw_proxy = _parse_proxy_for_playwright(proxy_url) if proxy_url else None
 
-class AbcexSession:
-    def __init__(self) -> None:
-        self.pw = None
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
-        self._cycles_ok = 0
-
-        proxy_url = _get_proxy_url()
-        self.pw_proxy = _parse_proxy_for_playwright(proxy_url) if proxy_url else None
-
-    async def start(self) -> None:
-        self.pw = await async_playwright().start()
-
+    async with async_playwright() as p:
         browser = None
         for attempt in (1, 2, 3):
             try:
@@ -575,9 +551,10 @@ class AbcexSession:
                         "--disable-dev-shm-usage",
                     ],
                 }
-                if self.pw_proxy:
-                    kwargs["proxy"] = self.pw_proxy
-                browser = await self.pw.chromium.launch(**kwargs)
+                if pw_proxy:
+                    kwargs["proxy"] = pw_proxy
+
+                browser = await p.chromium.launch(**kwargs)
                 break
             except Exception as e:
                 if _should_force_install(e):
@@ -589,13 +566,12 @@ class AbcexSession:
 
         if browser is None:
             raise RuntimeError("Cannot launch browser after retries.")
-        self.browser = browser
 
         storage_state = STATE_PATH if os.path.exists(STATE_PATH) else None
         if storage_state:
             log.info("Using saved session state: %s", storage_state)
 
-        self.context = await self.browser.new_context(
+        context = await browser.new_context(
             viewport={"width": 1440, "height": 810},
             locale="ru-RU",
             timezone_id="Europe/Moscow",
@@ -607,99 +583,56 @@ class AbcexSession:
             storage_state=storage_state,
         )
 
-        self.page = await self.context.new_page()
-        await self._install_routes(self.page)
-        await self._bootstrap()
-
-    async def _install_routes(self, page: Page) -> None:
-        async def _route(route, request):
-            rt = request.resource_type
-            url = request.url.lower()
-
-            if rt in ("image", "media", "font"):
-                return await route.abort()
-
-            if any(x in url for x in ["google-analytics", "googletagmanager", "metrika", "doubleclick"]):
-                return await route.abort()
-
-            return await route.continue_()
-
-        await page.route("**/*", _route)
-
-    async def _bootstrap(self) -> None:
-        assert self.page is not None
-        assert self.context is not None
-
-        log.info("Opening ABCEX: %s", ABCEX_URL)
-        await _goto_stable(self.page, ABCEX_URL)
-
-        await accept_cookies_if_any(self.page)
-        await login_if_needed(self.page, ABCEX_EMAIL, ABCEX_PASSWORD)
-
-        await _goto_stable(self.page, ABCEX_URL)
+        page = await context.new_page()
+        page.set_default_timeout(20_000)
+        page.set_default_navigation_timeout(GOTO_TIMEOUT_MS)
 
         try:
-            await self.context.storage_state(path=STATE_PATH)
-            log.info("Saved session state to %s", STATE_PATH)
+            log.info("Opening ABCEX: %s", ABCEX_URL)
+            await _goto_stable(page, ABCEX_URL)
+
+            await accept_cookies_if_any(page)
+            await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
+
+            # иногда после логина уводит/перерисовывает — возвращаемся на нужный URL
+            await _goto_stable(page, ABCEX_URL)
+
+            try:
+                await context.storage_state(path=STATE_PATH)
+                log.info("Saved session state to %s", STATE_PATH)
+            except Exception as e:
+                log.warning("Could not save storage state: %s", e)
+
+            await click_trades_tab_best_effort(page)
+
+            # ждём, пока сделки реально начнут парситься
+            await wait_trades_parsable(page, timeout_ms=WAIT_TRADES_TIMEOUT_MS, min_rows=5)
+
+            trades = await extract_trades(page, limit=LIMIT)
+            log.info("Parsed trades (validated): %d", len(trades))
+
+            if not trades:
+                await save_debug(page, "parsed_zero_trades")
+
+            return trades
+
         except Exception as e:
-            log.warning("Could not save storage state: %s", e)
+            await save_debug(page, "cycle_error")
+            raise e
 
-        await click_trades_tab_best_effort(self.page)
-        fr_url = await wait_trades_parsable_any_frame(self.page, timeout_ms=WAIT_TRADES_TIMEOUT_MS, min_rows=5)
-        log.info("Trades detected in frame=%s", fr_url)
-
-    async def fetch_trades(self) -> List[Dict[str, Any]]:
-        assert self.page is not None
-
-        if self._cycles_ok > 0 and self._cycles_ok % 25 == 0:
-            log.info("Soft refresh page after %s cycles...", self._cycles_ok)
-            await _goto_stable(self.page, ABCEX_URL)
-            await click_trades_tab_best_effort(self.page)
-            await wait_trades_parsable_any_frame(self.page, timeout_ms=WAIT_TRADES_TIMEOUT_MS, min_rows=5)
-
-        rows, fr_url = await extract_trades_any_frame(self.page, limit=LIMIT)
-        log.info("Parsed trades: %d (frame=%s)", len(rows), fr_url)
-
-        if len(rows) == 0:
-            global _last_zero_debug_ts
-            now = time.time()
-            if now - _last_zero_debug_ts > 600:
-                _last_zero_debug_ts = now
-                await save_debug(self.page, "parsed_zero_trades")
-
-            log.warning("Zero rows; reloading and retrying...")
-            await _goto_stable(self.page, ABCEX_URL)
-            await click_trades_tab_best_effort(self.page)
-            await wait_trades_parsable_any_frame(self.page, timeout_ms=WAIT_TRADES_TIMEOUT_MS, min_rows=5)
-            rows, fr_url = await extract_trades_any_frame(self.page, limit=LIMIT)
-            log.info("Parsed trades after reload: %d (frame=%s)", len(rows), fr_url)
-
-        self._cycles_ok += 1
-        return rows
-
-    async def close(self) -> None:
-        try:
-            if self.page:
-                await self.page.close()
-        except Exception:
-            pass
-        try:
-            if self.context:
-                await self.context.close()
-        except Exception:
-            pass
-        try:
-            if self.browser:
-                await self.browser.close()
-        except Exception:
-            pass
-        try:
-            if self.pw:
-                await self.pw.stop()
-        except Exception:
-            pass
-
-# ───────────────────────── MAIN ─────────────────────────
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 async def main() -> None:
     ensure_playwright_browsers(force=False)
@@ -707,54 +640,38 @@ async def main() -> None:
     seen: Dict[TradeKey, float] = {}
     seen_ttl = 60 * 30  # 30 минут
 
-    session: Optional[AbcexSession] = None
+    while True:
+        try:
+            trades = await run_once()
 
-    async with httpx.AsyncClient(timeout=35.0, trust_env=True) as supa_client:
-        while True:
-            try:
-                if session is None:
-                    session = AbcexSession()
-                    await session.start()
+            now = time.time()
+            for k, ts in list(seen.items()):
+                if now - ts > seen_ttl:
+                    del seen[k]
 
-                trades = await session.fetch_trades()
+            fresh: List[Dict[str, Any]] = []
+            for t in trades:
+                k = trade_key(t)
+                if k in seen:
+                    continue
+                seen[k] = now
+                fresh.append(t)
 
-                now = time.time()
-                for k, ts in list(seen.items()):
-                    if now - ts > seen_ttl:
-                        del seen[k]
+            if fresh:
+                await supabase_upsert_trades(fresh)
+            else:
+                log.info("No new trades after in-memory dedup.")
 
-                fresh: List[Dict[str, Any]] = []
-                for t in trades:
-                    k = trade_key(t)
-                    if k in seen:
-                        continue
-                    seen[k] = now
-                    fresh.append(t)
-
-                if fresh:
-                    await supabase_upsert_trades(fresh, supa_client)
-                else:
-                    log.info("No new trades after in-memory dedup.")
-
-            except Exception as e:
-                log.error("Cycle error: %s", e)
-
-                if _should_force_install(e):
-                    try:
-                        ensure_playwright_browsers(force=True)
-                    except Exception as ie:
-                        log.error("Forced install failed: %s", ie)
-
+        except Exception as e:
+            log.error("Cycle error: %s", e)
+            if _should_force_install(e):
                 try:
-                    if session:
-                        await session.close()
-                except Exception:
-                    pass
-                session = None
+                    ensure_playwright_browsers(force=True)
+                except Exception as ie:
+                    log.error("Forced install failed: %s", ie)
+            await asyncio.sleep(4.0)
 
-                await asyncio.sleep(4.0)
-
-            await asyncio.sleep(POLL_SEC)
+        await asyncio.sleep(POLL_SEC)
 
 if __name__ == "__main__":
     asyncio.run(main())
