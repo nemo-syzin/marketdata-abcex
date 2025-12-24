@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import httpx
-from playwright.async_api import async_playwright, Page, Frame, Locator
+from playwright.async_api import async_playwright, Page
 
 # ───────────────────────── CONFIG ─────────────────────────
 
@@ -40,14 +40,14 @@ SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))
 WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "45000"))
 
-# Санити-фильтры (подкручиваются ENV)
-PRICE_MIN = Decimal(os.getenv("PRICE_MIN", "50"))      # USDT/RUB
-PRICE_MAX = Decimal(os.getenv("PRICE_MAX", "200"))     # USDT/RUB
-VOL_USDT_MIN = Decimal(os.getenv("VOL_USDT_MIN", "0.00000001"))
-VOL_USDT_MAX = Decimal(os.getenv("VOL_USDT_MAX", "500000"))  # защита от мусора
+# sanity для USDT/RUB
+PRICE_MIN = Decimal(os.getenv("PRICE_MIN", "50"))
+PRICE_MAX = Decimal(os.getenv("PRICE_MAX", "200"))
 
-# Подсказка для выбора "что из двух чисел является ценой"
-PRICE_HINT = Decimal(os.getenv("PRICE_HINT", "80"))
+# Диагностика в логах
+DIAG = os.getenv("DIAG", "1") == "1"
+DIAG_TEXT_CHARS = int(os.getenv("DIAG_TEXT_CHARS", "1400"))
+DIAG_MAX_SAMPLES = int(os.getenv("DIAG_MAX_SAMPLES", "6"))
 
 # Render cache path
 BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
@@ -55,7 +55,10 @@ os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
 
 # ───────────────────────── LOGGING ─────────────────────────
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+)
 log = logging.getLogger("abcex")
 
 # ───────────────────────── INSTALL ─────────────────────────
@@ -142,7 +145,7 @@ def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
 # ───────────────────────── NUMBERS / TIME ─────────────────────────
 
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
-STRICT_TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$")
+STRICT_TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$")
 
 def _q8(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
@@ -154,9 +157,9 @@ def _to_decimal_num(text: str) -> Decimal:
     if not t:
         raise InvalidOperation("empty numeric")
     if "," in t and "." in t:
-        t = t.replace(",", "")  # ',' как разделитель тысяч
+        t = t.replace(",", "")
     else:
-        t = t.replace(",", ".")  # ',' как десятичный
+        t = t.replace(",", ".")
     return Decimal(t)
 
 def _normalize_time_to_hhmmss(text: str) -> Optional[str]:
@@ -171,38 +174,138 @@ def _normalize_time_to_hhmmss(text: str) -> Optional[str]:
     hh, mm, ss = parts
     return f"{hh.zfill(2)}:{mm}:{ss.zfill(2)}"
 
-def _is_valid_time_hhmmss(tt: str) -> bool:
+def _is_valid_time(tt: str) -> bool:
     return bool(tt and STRICT_TIME_RE.match(tt))
 
 def _price_ok(p: Decimal) -> bool:
     return (p >= PRICE_MIN) and (p <= PRICE_MAX)
 
-def _vol_ok(v: Decimal) -> bool:
-    return (v >= VOL_USDT_MIN) and (v <= VOL_USDT_MAX)
+# ───────────────────────── DIAG (LOG ONLY) ─────────────────────────
 
-# ───────────────────────── DEBUG ARTIFACTS ─────────────────────────
-
-async def save_debug(page: Page, tag: str) -> None:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    png = f"debug_{tag}_{ts}.png"
-    html = f"debug_{tag}_{ts}.html"
+async def log_diag(page: Page, tag: str) -> None:
+    if not DIAG:
+        return
 
     try:
-        # full_page=False снижает шанс зависания на шрифтах
-        await page.screenshot(path=png, full_page=False, timeout=8_000)
-        log.warning("Saved debug screenshot: %s", png)
+        frames = page.frames
+        log.warning("DIAG[%s] url=%s frames=%d", tag, page.url, len(frames))
+        for i, fr in enumerate(frames[:10]):
+            try:
+                log.warning("DIAG[%s] frame[%d] url=%s", tag, i, fr.url)
+            except Exception:
+                pass
     except Exception as e:
-        log.warning("Could not save screenshot: %s", e)
+        log.warning("DIAG[%s] frames failed: %s", tag, e)
 
+    js = r"""
+    (maxChars, maxSamples) => {
+      const timeRe = /\b(\d{1,2}:\d{2}(?::\d{2})?)\b/;
+      const numRe = /(?:^|[^\d])(\d[\d\s.,]*\d|\d)(?:[^\d]|$)/g;
+
+      const pickRoot = () => {
+        const roots = [
+          document.querySelector("[role='tabpanel'][data-state='active']"),
+          document.querySelector("[role='tabpanel']:not([hidden])"),
+          document.querySelector("[role='tabpanel']"),
+          document.querySelector("main"),
+          document.body
+        ].filter(Boolean);
+        return roots[0] || document.body;
+      };
+
+      const root = pickRoot();
+
+      const rootText = (root.innerText || "").replace(/\u00a0/g, " ").trim();
+      const textSnippet = rootText.slice(0, maxChars);
+
+      // Сколько вообще "времен" на root
+      const allTexts = (rootText || "").split("\n").map(s => s.trim()).filter(Boolean);
+      let timeLines = [];
+      for (const line of allTexts) {
+        if (!timeRe.test(line)) continue;
+        timeLines.push(line);
+        if (timeLines.length >= 1000) break;
+      }
+
+      // Пробуем найти строки, где есть время + 2 числа (очень похоже на сделки)
+      const candidates = [];
+      for (const line of allTexts) {
+        if (!timeRe.test(line)) continue;
+        const nums = (line.match(numRe) || []).map(x => x.replace(/^[^\d]+|[^\d]+$/g, ""));
+        if (nums.length >= 2) {
+          candidates.push(line);
+          if (candidates.length >= maxSamples) break;
+        }
+      }
+
+      // Теперь более "DOM" подход: ищем элементы, внутри которых есть time + 2 числа
+      const elements = [];
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      let n = walker.currentNode;
+      let safety = 0;
+      while (n && safety < 6000) {
+        safety++;
+        const el = n;
+        const txt = (el.innerText || "").replace(/\u00a0/g, " ").trim();
+        if (txt && txt.length < 220 && timeRe.test(txt)) {
+          const nums = (txt.match(numRe) || []).map(x => x.replace(/^[^\d]+|[^\d]+$/g, ""));
+          if (nums.length >= 2) {
+            elements.push(txt);
+            if (elements.length >= maxSamples) break;
+          }
+        }
+        n = walker.nextNode();
+      }
+
+      // tabpanel summary
+      const tabpanels = Array.from(document.querySelectorAll("[role='tabpanel']")).slice(0, 8).map(tp => {
+        return {
+          hidden: tp.hasAttribute("hidden"),
+          data_state: tp.getAttribute("data-state"),
+          text: (tp.innerText || "").replace(/\u00a0/g, " ").trim().slice(0, 180)
+        }
+      });
+
+      return {
+        rootTag: root.tagName,
+        rootTextLen: rootText.length,
+        textSnippet,
+        timeLinesCount: timeLines.length,
+        candidates,
+        elements,
+        tabpanels
+      };
+    }
+    """
     try:
-        content = await page.content()
-        with open(html, "w", encoding="utf-8") as f:
-            f.write(content)
-        log.warning("Saved debug html: %s", html)
-    except Exception as e:
-        log.warning("Could not save html: %s", e)
+        out = await page.evaluate(js, DIAG_TEXT_CHARS, DIAG_MAX_SAMPLES)
+        log.warning(
+            "DIAG[%s] root=%s rootTextLen=%s timeLines=%s",
+            tag, out.get("rootTag"), out.get("rootTextLen"), out.get("timeLinesCount")
+        )
+        if out.get("tabpanels"):
+            for i, tp in enumerate(out["tabpanels"]):
+                log.warning(
+                    "DIAG[%s] tabpanel[%d] hidden=%s state=%s text=%s",
+                    tag, i, tp.get("hidden"), tp.get("data_state"), tp.get("text")
+                )
 
-# ───────────────────────── PAGE HELPERS (frames-aware) ─────────────────────────
+        if out.get("candidates"):
+            for i, s in enumerate(out["candidates"]):
+                log.warning("DIAG[%s] candidateLine[%d]=%s", tag, i, s)
+
+        if out.get("elements"):
+            for i, s in enumerate(out["elements"]):
+                log.warning("DIAG[%s] candidateEl[%d]=%s", tag, i, s)
+
+        snippet = out.get("textSnippet") or ""
+        if snippet:
+            log.warning("DIAG[%s] rootTextSnippet:\n%s", tag, snippet)
+
+    except Exception as e:
+        log.warning("DIAG[%s] evaluate failed: %s", tag, e)
+
+# ───────────────────────── PAGE ACTIONS ─────────────────────────
 
 async def accept_cookies_if_any(page: Page) -> None:
     for txt in ["Принять", "Согласен", "Я согласен", "Accept", "I agree"]:
@@ -216,42 +319,17 @@ async def accept_cookies_if_any(page: Page) -> None:
         except Exception:
             pass
 
-async def _find_visible_in_all_frames(page: Page, selectors: List[str], per_selector_scan: int = 10) -> Optional[Tuple[Locator, str]]:
-    """
-    Ищем первый видимый элемент среди всех frames/page.
-    Возвращаем (locator, frame_url).
-    """
-    frames: List[Frame] = page.frames  # включает main frame
-    for fr in frames:
-        for sel in selectors:
-            try:
-                loc = fr.locator(sel)
-                cnt = await loc.count()
-                if cnt <= 0:
-                    continue
-                for i in range(min(cnt, per_selector_scan)):
-                    cand = loc.nth(i)
-                    try:
-                        if await cand.is_visible():
-                            return cand, fr.url
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-    return None
-
 async def _is_login_visible(page: Page) -> bool:
-    found = await _find_visible_in_all_frames(page, [
-        "input[type='password']",
-        "input[autocomplete='current-password']",
-        "input[name*='pass' i]",
-    ])
-    return found is not None
+    try:
+        pw = page.locator("input[type='password']")
+        return (await pw.count() > 0) and (await pw.first.is_visible())
+    except Exception:
+        return False
 
 async def _open_login_modal_if_needed(page: Page) -> None:
     if await _is_login_visible(page):
         return
-    found = await _find_visible_in_all_frames(page, [
+    for sel in [
         "button:has-text('Войти')",
         "a:has-text('Войти')",
         "text=Войти",
@@ -261,16 +339,15 @@ async def _open_login_modal_if_needed(page: Page) -> None:
         "button:has-text('Sign in')",
         "a:has-text('Sign in')",
         "text=Sign in",
-    ])
-    if not found:
-        return
-    btn, fr_url = found
-    try:
-        await btn.click(timeout=7_000)
-        log.info("Opened login UI (frame=%s).", fr_url)
-        await page.wait_for_timeout(800)
-    except Exception:
-        pass
+    ]:
+        try:
+            btn = page.locator(sel)
+            if await btn.count() > 0 and await btn.first.is_visible():
+                await btn.first.click(timeout=7_000)
+                await page.wait_for_timeout(800)
+                return
+        except Exception:
+            pass
 
 async def login_if_needed(page: Page, email: str, password: str) -> None:
     await _open_login_modal_if_needed(page)
@@ -284,49 +361,28 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
 
     log.info("Login detected. Performing sign-in ...")
 
-    email_found = await _find_visible_in_all_frames(page, [
-        "input[type='email']",
-        "input[autocomplete='username']",
-        "input[name*='mail' i]",
-        "input[name*='login' i]",
-        "input[placeholder*='mail' i]",
-        "input[placeholder*='email' i]",
-        "input[placeholder*='почта' i]",
-    ])
-    pw_found = await _find_visible_in_all_frames(page, [
-        "input[type='password']",
-        "input[autocomplete='current-password']",
-        "input[name*='pass' i]",
-    ])
+    email_loc = page.locator(
+        "input[type='email'], input[autocomplete='username'], input[name*='mail' i], input[name*='login' i]"
+    ).first
+    pw_loc = page.locator("input[type='password'], input[autocomplete='current-password']").first
 
-    if not email_found or not pw_found:
-        await save_debug(page, "login_fields_not_found")
-        raise RuntimeError("Не смог найти поля email/password (включая frames).")
-
-    email_loc, email_fr = email_found
-    pw_loc, pw_fr = pw_found
+    if not await email_loc.is_visible() or not await pw_loc.is_visible():
+        await log_diag(page, "login_fields_not_visible")
+        raise RuntimeError("Не смог найти/увидеть поля email/password.")
 
     await email_loc.fill(email, timeout=10_000)
     await pw_loc.fill(password, timeout=10_000)
 
-    submit_found = await _find_visible_in_all_frames(page, [
-        "button[type='submit']",
-        "button:has-text('Войти')",
-        "button:has-text('Вход')",
-        "button:has-text('Login')",
-        "button:has-text('Sign in')",
-    ])
-    if submit_found:
-        btn, fr_url = submit_found
-        try:
-            await btn.click(timeout=10_000)
-            log.info("Clicked submit (frame=%s).", fr_url)
-        except Exception:
-            try:
-                await page.keyboard.press("Enter")
-            except Exception:
-                pass
-    else:
+    submit = page.locator(
+        "button[type='submit'], button:has-text('Войти'), button:has-text('Login'), button:has-text('Sign in')"
+    ).first
+    try:
+        if await submit.is_visible():
+            await submit.click(timeout=10_000)
+            log.info("Clicked submit (frame=%s).", page.url)
+        else:
+            await page.keyboard.press("Enter")
+    except Exception:
         try:
             await page.keyboard.press("Enter")
         except Exception:
@@ -334,197 +390,150 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
 
     await page.wait_for_timeout(1_000)
 
-    for _ in range(80):
+    for _ in range(60):
         if not await _is_login_visible(page):
             log.info("Login successful (password field disappeared).")
             return
         await page.wait_for_timeout(400)
 
-    await save_debug(page, "login_failed")
+    await log_diag(page, "login_failed")
     raise RuntimeError("Логин не прошёл (форма логина всё ещё видна).")
 
 async def click_trades_tab_best_effort(page: Page) -> None:
-    # Пытаемся включить вкладку "Сделки/Trades" — тоже через frames
     candidates = ["Сделки", "Trades", "Order history", "История", "Последние сделки"]
-    selectors: List[str] = []
     for t in candidates:
-        selectors += [
+        for sel in [
             f"[role='tab']:has-text('{t}')",
             f"button:has-text('{t}')",
             f"a:has-text('{t}')",
             f"text={t}",
-        ]
-    found = await _find_visible_in_all_frames(page, selectors)
-    if not found:
-        return
-    el, fr_url = found
-    try:
-        await el.click(timeout=8_000)
-        log.info("Clicked trades tab (frame=%s).", fr_url)
-        await page.wait_for_timeout(800)
-    except Exception:
-        pass
+        ]:
+            try:
+                el = page.locator(sel).first
+                if await el.count() > 0 and await el.is_visible():
+                    await el.click(timeout=8_000)
+                    await page.wait_for_timeout(900)
+                    log.info("Clicked trades tab (frame=%s).", page.url)
+                    return
+            except Exception:
+                continue
 
-# ───────────────────────── PARSING (frame-aware) ─────────────────────────
+# ───────────────────────── PARSING ─────────────────────────
 
-JS_TRIPLETS = r"""
-(limit) => {
-  const timeRe = /\b(\d{1,2}:\d{2}(?::\d{2})?)\b/;
+async def _extract_trade_lines(page: Page, limit: int) -> List[str]:
+    """
+    Самый устойчивый подход без знания DOM:
+    берём innerText активного контейнера (tabpanel/main/body),
+    режем на строки и оставляем строки, где есть время и минимум 2 числа.
+    """
+    js = r"""
+    (limit) => {
+      const timeRe = /\b(\d{1,2}:\d{2}(?::\d{2})?)\b/;
+      const numRe = /(?:^|[^\d])(\d[\d\s.,]*\d|\d)(?:[^\d]|$)/g;
 
-  const pickRoot = () => {
-    const roots = [
-      document.querySelector("[role='tabpanel'][data-state='active']"),
-      document.querySelector("[role='tabpanel']:not([hidden])"),
-      document.querySelector("[role='tabpanel']"),
-      document.querySelector("main"),
-      document.body
-    ].filter(Boolean);
-    return roots[0] || document.body;
-  };
+      const pickRoot = () => {
+        const roots = [
+          document.querySelector("[role='tabpanel'][data-state='active']"),
+          document.querySelector("[role='tabpanel']:not([hidden])"),
+          document.querySelector("[role='tabpanel']"),
+          document.querySelector("main"),
+          document.body
+        ].filter(Boolean);
+        return roots[0] || document.body;
+      };
 
-  const root = pickRoot();
-  const out = [];
-  const seen = new Set();
+      const root = pickRoot();
+      const text = (root.innerText || "").replace(/\u00a0/g, " ").trim();
+      if (!text) return [];
 
-  const divs = Array.from(root.querySelectorAll("div")).slice(0, 9000);
+      const lines = text.split("\n").map(s => s.trim()).filter(Boolean);
 
-  for (const div of divs) {
-    // основной формат, который у тебя уже работал: p[data-size='xs']
-    const ps = div.querySelectorAll("p[data-size='xs']");
-    if (!ps || ps.length < 3) continue;
+      const out = [];
+      const seen = new Set();
 
-    const texts = Array.from(ps).slice(0, 6).map(p => (p.textContent || "").trim()).filter(Boolean);
-    if (texts.length < 3) continue;
+      for (const line of lines) {
+        if (!timeRe.test(line)) continue;
+        const nums = (line.match(numRe) || []).map(x => x.replace(/^[^\d]+|[^\d]+$/g, ""));
+        if (nums.length < 2) continue;
 
-    for (let i = 0; i < texts.length; i++) {
-      const m = texts[i].match(timeRe);
-      if (!m) continue;
-      const timeTxt = m[1];
+        // лёгкая защита от “слишком длинных” строк
+        const s = line.length > 220 ? line.slice(0, 220) : line;
 
-      const nums = texts
-        .filter((_, idx) => idx !== i)
-        .filter(x => /^[0-9]/.test(x));
-
-      if (nums.length < 2) continue;
-
-      const a = nums[0];
-      const b = nums[1];
-
-      const key = `${timeTxt}|${a}|${b}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      out.push({ a, b, time_raw: timeTxt });
-      if (out.length >= limit) return out;
+        if (seen.has(s)) continue;
+        seen.add(s);
+        out.push(s);
+        if (out.length >= limit) break;
+      }
+      return out;
     }
-  }
-  return out;
-}
-"""
-
-async def _extract_raw_triplets_from_frame(fr: Frame, limit: int) -> List[Dict[str, str]]:
-    try:
-        return await fr.evaluate(JS_TRIPLETS, limit)
-    except Exception:
-        return []
-
-async def _extract_raw_triplets_best_target(page: Page, limit: int) -> Tuple[List[Dict[str, str]], str]:
-    best: List[Dict[str, str]] = []
-    best_where = "page"
-
-    # main page
-    try:
-        raw_page = await page.evaluate(JS_TRIPLETS, limit)
-        if len(raw_page) > len(best):
-            best = raw_page
-            best_where = "page"
-    except Exception:
-        pass
-
-    # frames
-    for fr in page.frames:
-        raw = await _extract_raw_triplets_from_frame(fr, limit)
-        if len(raw) > len(best):
-            best = raw
-            best_where = fr.url or "frame"
-
-    return best, best_where
-
-def _candidate_score(price: Decimal, hint: Decimal) -> Decimal:
-    return abs(price - hint)
-
-def _apply_price_scaling_if_needed(p: Decimal) -> List[Decimal]:
     """
-    Если цена выглядит как 86836 вместо 86.836 — пробуем делить.
-    Возвращаем список кандидатов (включая исходный).
-    """
-    outs = [p]
-    if p <= 0:
-        return outs
-    for div in (Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")):
-        outs.append(p / div)
-    return outs
+    return await page.evaluate(js, limit)
 
-def _try_parse_trade(a: str, b: str, time_raw: str, price_hint: Decimal) -> Optional[Tuple[Decimal, Decimal, str]]:
-    tt = _normalize_time_to_hhmmss(time_raw)
-    if not tt or not _is_valid_time_hhmmss(tt):
+def _try_parse_from_line(line: str) -> Optional[Tuple[Decimal, Decimal, str]]:
+    """
+    Ищем в строке:
+      - время
+      - два числа (первое/второе)
+    Дальше решаем, что из них цена.
+    """
+    tt = _normalize_time_to_hhmmss(line)
+    if not tt or not _is_valid_time(tt):
         return None
 
-    def parse_num(x: str) -> Optional[Decimal]:
+    # достаём числа
+    raw_nums = re.findall(r"\d[\d\s.,]*\d|\d", line.replace("\xa0", " "))
+    if len(raw_nums) < 2:
+        return None
+
+    # берём первые два как кандидаты
+    a_txt, b_txt = raw_nums[0], raw_nums[1]
+
+    def parse(x: str) -> Optional[Decimal]:
         try:
-            return _q8(_to_decimal_num(x))
+            v = _q8(_to_decimal_num(x))
+            if v <= 0:
+                return None
+            return v
         except Exception:
             return None
 
-    da = parse_num(a)
-    db = parse_num(b)
-    if da is None or db is None:
+    a = parse(a_txt)
+    b = parse(b_txt)
+    if not a or not b:
         return None
 
-    # Два варианта: price=a qty=b или наоборот.
-    # Для каждого варианта пробуем еще "масштабирование" цены.
-    candidates: List[Tuple[Decimal, Decimal]] = []
+    # Вариант 1: a=price, b=qty
+    if _price_ok(a):
+        return a, b, tt
+    # Вариант 2: b=price, a=qty
+    if _price_ok(b):
+        return b, a, tt
 
-    for p_raw, q_raw in ((da, db), (db, da)):
-        for p in _apply_price_scaling_if_needed(p_raw):
-            p = _q8(p)
-            q = _q8(q_raw)
-            if p <= 0 or q <= 0:
-                continue
-            if not _vol_ok(q):
-                continue
-            if not _price_ok(p):
-                continue
-            candidates.append((p, q))
+    # Вариант 3: цена могла попасть как “копейки/пункты”
+    # пробуем деления для обоих
+    for p_raw, q_raw in ((a, b), (b, a)):
+        if p_raw > PRICE_MAX:
+            for div in (Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000"), Decimal("100000")):
+                pp = p_raw / div
+                if _price_ok(pp):
+                    return _q8(pp), q_raw, tt
 
-    if not candidates:
-        return None
+    return None
 
-    # Выбор лучшего по близости к price_hint
-    best = min(candidates, key=lambda pq: _candidate_score(pq[0], price_hint))
-    return best[0], best[1], tt
-
-async def extract_trades(page: Page, limit: int, price_hint: Decimal) -> Tuple[List[Dict[str, Any]], Decimal, str]:
-    raw, where = await _extract_raw_triplets_best_target(page, limit=limit)
-    log.info("Raw triplets: %d (best_target=%s)", len(raw), where)
+async def extract_trades(page: Page, limit: int) -> List[Dict[str, Any]]:
+    lines = await _extract_trade_lines(page, limit=limit)
+    log.info("Raw trade lines: %d", len(lines))
 
     rows: List[Dict[str, Any]] = []
-    prices: List[Decimal] = []
     rejected = 0
 
-    for r in raw:
-        a = str(r.get("a") or "").strip()
-        b = str(r.get("b") or "").strip()
-        tr = str(r.get("time_raw") or "").strip()
-
-        parsed = _try_parse_trade(a, b, tr, price_hint=price_hint)
+    for line in lines:
+        parsed = _try_parse_from_line(line)
         if not parsed:
             rejected += 1
             continue
-
         price, vol_usdt, tt = parsed
         vol_rub = _q8(price * vol_usdt)
-
         rows.append({
             "source": SOURCE,
             "symbol": SYMBOL,
@@ -533,43 +542,34 @@ async def extract_trades(page: Page, limit: int, price_hint: Decimal) -> Tuple[L
             "volume_rub": str(vol_rub),
             "trade_time": tt,
         })
-        prices.append(price)
 
     if rejected:
-        log.info("Rejected rows (failed parse/sanity): %d", rejected)
+        log.info("Rejected lines (failed parse/sanity): %s", rejected)
 
-    # Обновим hint по медиане цен, если есть
-    new_hint = price_hint
-    if prices:
-        prices_sorted = sorted(prices)
-        new_hint = prices_sorted[len(prices_sorted) // 2]
+    # Важно: если ноль — даём диагностику сразу
+    if not rows:
+        await log_diag(page, "extract_trades_zero")
 
-    return rows, new_hint, where
+    return rows
 
-async def wait_trades_parsable(page: Page, timeout_ms: int, min_rows: int, price_hint: Decimal) -> Tuple[Decimal, str]:
+async def wait_trades_parsable(page: Page, timeout_ms: int, min_rows: int = 5) -> None:
     start = time.time()
     last_n = -1
-    last_where = "unknown"
-    hint = price_hint
-
     while (time.time() - start) * 1000 < timeout_ms:
         try:
-            probe, hint2, where = await extract_trades(page, limit=50, price_hint=hint)
+            probe = await extract_trades(page, limit=60)
             n = len(probe)
-            last_where = where
-            hint = hint2
             if n != last_n:
-                log.info("Trades parsable probe: %d (where=%s)", n, where)
+                log.info("Trades parsable probe: %d", n)
                 last_n = n
             if n >= min_rows:
-                return hint, where
-        except Exception:
-            pass
-
+                return
+        except Exception as e:
+            log.warning("probe exception: %s", e)
         await page.wait_for_timeout(900)
 
-    await save_debug(page, "trades_not_parsable")
-    raise RuntimeError(f"Не дождался парсабельных сделок (time + 2 numbers). last_where={last_where}")
+    await log_diag(page, "trades_not_parsable")
+    raise RuntimeError("Не дождался парсабельных сделок (time + 2 numbers).")
 
 # ───────────────────────── SUPABASE ─────────────────────────
 
@@ -629,10 +629,9 @@ async def _goto_stable(page: Page, url: str) -> None:
         await page.wait_for_load_state("networkidle", timeout=20_000)
     except Exception:
         pass
-
     await page.wait_for_timeout(1_200)
 
-async def run_once(price_hint: Decimal) -> Tuple[List[Dict[str, Any]], Decimal]:
+async def run_once() -> List[Dict[str, Any]]:
     proxy_url = _get_proxy_url()
     pw_proxy = _parse_proxy_for_playwright(proxy_url) if proxy_url else None
 
@@ -691,7 +690,7 @@ async def run_once(price_hint: Decimal) -> Tuple[List[Dict[str, Any]], Decimal]:
             await accept_cookies_if_any(page)
             await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
 
-            # После логина UI может перекинуть — фиксируемся на нужной странице
+            # после логина — вернуться на spot, чтобы не остаться на /login
             await _goto_stable(page, ABCEX_URL)
 
             try:
@@ -702,22 +701,22 @@ async def run_once(price_hint: Decimal) -> Tuple[List[Dict[str, Any]], Decimal]:
 
             await click_trades_tab_best_effort(page)
 
-            # Дожидаемся парсинга (включая frames) и одновременно уточняем price_hint
-            price_hint2, where = await wait_trades_parsable(
-                page, timeout_ms=WAIT_TRADES_TIMEOUT_MS, min_rows=5, price_hint=price_hint
-            )
-            log.info("Trades are parsable (where=%s). price_hint=%s", where, price_hint2)
+            # Если вообще не видим времени/табов — сразу логируем состояние
+            await log_diag(page, "after_click_trades_tab")
 
-            trades, price_hint3, where2 = await extract_trades(page, limit=LIMIT, price_hint=price_hint2)
-            log.info("Parsed trades (validated): %d (where=%s)", len(trades), where2)
+            await wait_trades_parsable(page, timeout_ms=WAIT_TRADES_TIMEOUT_MS, min_rows=5)
 
-            if not trades:
-                await save_debug(page, "parsed_zero_trades")
+            trades = await extract_trades(page, limit=LIMIT)
+            log.info("Parsed trades (validated): %d", len(trades))
 
-            return trades, price_hint3
+            # Для контроля: покажем 3 первых строки
+            for i, t in enumerate(trades[:3]):
+                log.info("Sample trade[%d]: %s", i, t)
+
+            return trades
 
         except Exception as e:
-            await save_debug(page, "cycle_error")
+            await log_diag(page, "cycle_error")
             raise e
 
         finally:
@@ -740,11 +739,9 @@ async def main() -> None:
     seen: Dict[TradeKey, float] = {}
     seen_ttl = 60 * 30  # 30 минут
 
-    price_hint = PRICE_HINT
-
     while True:
         try:
-            trades, price_hint = await run_once(price_hint=price_hint)
+            trades = await run_once()
 
             now = time.time()
             for k, ts in list(seen.items()):
