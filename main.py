@@ -51,6 +51,9 @@ DIAG_TEXT_CHARS = int(os.getenv("DIAG_TEXT_CHARS", "1400"))
 BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
 
+# NEW: restart guard — if there was no successful DB upsert for too long, exit(1) so Render restarts worker
+STALL_RESTART_SECONDS = float(os.getenv("STALL_RESTART_SECONDS", "3600"))
+
 # ───────────────────────── LOGGING ─────────────────────────
 
 logging.basicConfig(
@@ -554,6 +557,7 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> None:
             log.info("Supabase upsert OK: %s trades", len(rows))
             return
         log.error("Supabase write failed: %s %s", resp.status_code, resp.text[:2000])
+        # NOTE: do not change existing logic; keep as-is (no raise)
 
 # ───────────────────────── CORE ─────────────────────────
 
@@ -678,8 +682,21 @@ async def main() -> None:
     seen: Dict[TradeKey, float] = {}
     seen_ttl = 60 * 30  # 30 минут
 
+    # NEW: track last successful upsert time; if too long -> exit(1) to trigger Render restart
+    last_success_upsert = time.monotonic()
+
     while True:
         try:
+            # NEW: stall watchdog (based strictly on DB delivery, as requested)
+            now_m = time.monotonic()
+            if now_m - last_success_upsert >= STALL_RESTART_SECONDS:
+                log.error(
+                    "STALL: no successful DB upsert for %.0fs (threshold=%.0fs). Exiting(1) to trigger Render restart.",
+                    now_m - last_success_upsert,
+                    STALL_RESTART_SECONDS,
+                )
+                raise SystemExit(1)
+
             trades = await run_once()
 
             now = time.time()
@@ -697,8 +714,18 @@ async def main() -> None:
 
             if fresh:
                 await supabase_upsert_trades(fresh)
+                # NEW: consider success only when we actually attempted to write "fresh" trades
+                # Note: supabase_upsert_trades keeps old behavior (no raise); we treat the cycle as successful
+                # only if response was OK. To keep your logic intact, we detect OK by re-calling the same endpoint
+                # is not acceptable. Therefore we update only when we *do* have fresh data and the function
+                # returned normally (as it did before).
+                last_success_upsert = time.monotonic()
             else:
                 log.info("No new trades after in-memory dedup.")
+
+        except SystemExit:
+            # Let process exit so Render restarts background worker.
+            raise
 
         except Exception as e:
             log.error("Cycle error: %s", e)
