@@ -49,9 +49,7 @@ BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-pla
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
 
 STALL_RESTART_SECONDS = float(os.getenv("STALL_RESTART_SECONDS", "3600"))
-
-# Жёсткий лимит на один цикл (если внезапно повиснет где-то без таймаута)
-CYCLE_HARD_TIMEOUT_SEC = float(os.getenv("CYCLE_HARD_TIMEOUT_SEC", "210"))
+CYCLE_HARD_TIMEOUT_SEC = float(os.getenv("CYCLE_HARD_TIMEOUT_SEC", "240"))
 
 # ───────────────────────── LOGGING ─────────────────────────
 
@@ -125,21 +123,20 @@ def _should_force_install(err: Exception) -> bool:
 
 # ───────────────────────── PROXY ─────────────────────────
 
-def _build_proxy_from_parts() -> Optional[str]:
+def _build_proxy_url() -> Optional[str]:
     """
-    Поддержка двух схем:
-    1) стандартные HTTP_PROXY / HTTPS_PROXY (приоритет)
+    Приоритет:
+    1) HTTPS_PROXY / HTTP_PROXY (стандартно)
     2) PROXY_SERVER + PROXY_USERNAME + PROXY_PASSWORD
-       PROXY_SERVER пример: http://158.46.180.246:4948  или socks5://158.46.180.246:14948
+       PROXY_SERVER пример: http://ip:port  или socks5://ip:port
     """
     std = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
     if std:
-        return std
+        return std.strip()
 
     server = os.getenv("PROXY_SERVER", "").strip()
     user = os.getenv("PROXY_USERNAME", "").strip()
     pw = os.getenv("PROXY_PASSWORD", "").strip()
-
     if not server:
         return None
 
@@ -149,7 +146,6 @@ def _build_proxy_from_parts() -> Optional[str]:
             return f"{u.scheme}://{user}:{pw}@{u.hostname}:{u.port}"
         return server
 
-    # если server кривой/без схемы — вернём как есть (на риск пользователя)
     return server
 
 def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
@@ -171,6 +167,14 @@ def _q8(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
 
 def _to_decimal_num(text: str) -> Decimal:
+    """
+    Понимает:
+      79.30
+      5,004.5041
+      10,734.6612
+      1 020.2238
+      1 020,2238
+    """
     t = (text or "").strip().replace("\xa0", " ")
     t = re.sub(r"[^0-9\s\.,-]", "", t)
     t = t.replace(" ", "")
@@ -309,24 +313,65 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
     raise RuntimeError("Логин не прошёл (форма логина всё ещё видна).")
 
 async def click_trades_tab_best_effort(page: Page) -> bool:
-    candidates = ["Сделки", "Trades", "Order history", "История", "Последние сделки"]
-    for t in candidates:
-        for sel in [
-            f"[role='tab']:has-text('{t}')",
-            f"button:has-text('{t}')",
-            f"a:has-text('{t}')",
-            f"text={t}",
-        ]:
-            try:
-                el = page.locator(sel).first
-                if await el.count() > 0 and await el.is_visible():
-                    await el.click(timeout=8_000)
-                    await page.wait_for_timeout(700)
-                    log.info("Clicked trades tab by '%s'.", t)
-                    return True
-            except Exception:
-                continue
-    log.warning("Could not click trades tab (no matching visible selector).")
+    # часто табы ниже, поэтому скроллим
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    candidates = ["Trades", "Сделки", "Order history", "История", "Последние сделки"]
+
+    # 1) role=tab
+    for name in candidates:
+        try:
+            tab = page.get_by_role("tab", name=name)
+            if await tab.count() > 0:
+                await tab.first.scroll_into_view_if_needed(timeout=5_000)
+                await tab.first.click(timeout=8_000)
+                await page.wait_for_timeout(700)
+                log.info("Clicked trades tab by role(tab) '%s'.", name)
+                return True
+        except Exception:
+            pass
+
+    # 2) текстовый клик (force)
+    for name in candidates:
+        try:
+            el = page.locator(f":text('{name}')").first
+            if await el.count() > 0:
+                await el.scroll_into_view_if_needed(timeout=5_000)
+                await el.click(timeout=8_000, force=True)
+                await page.wait_for_timeout(700)
+                log.info("Clicked trades tab by text '%s' (force).", name)
+                return True
+        except Exception:
+            pass
+
+    # 3) JS fallback
+    try:
+        ok = await page.evaluate(
+            """(names) => {
+              const norm = (s) => (s||'').trim().toLowerCase();
+              const want = new Set(names.map(norm));
+              const els = Array.from(document.querySelectorAll('button,a,[role="tab"],div,span'));
+              for (const el of els) {
+                const t = norm(el.textContent);
+                if (!t) continue;
+                if (want.has(t)) { el.click(); return true; }
+              }
+              return false;
+            }""",
+            candidates,
+        )
+        if ok:
+            await page.wait_for_timeout(700)
+            log.info("Clicked trades tab by JS fallback.")
+            return True
+    except Exception:
+        pass
+
+    log.warning("Could not click trades tab (no matching selector).")
     return False
 
 # ───────────────────────── ORDER HISTORY PANEL ─────────────────────────
@@ -354,26 +399,50 @@ async def get_order_history_panel(page: Page) -> Locator:
 async def wait_trades_ready(page: Page, timeout_ms: int) -> None:
     start = time.time()
     last = -1
+    retried_click = False
 
     while (time.time() - start) * 1000 < timeout_ms:
+        # 1) пытаемся найти панель (вдруг она уже активна)
         try:
-            panel = await get_order_history_panel(page)
-            handle = await panel.element_handle()
-            if handle:
-                n = await handle.evaluate(
-                    """(root) => {
-                      const re = /^(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$/;
-                      const ps = Array.from(root.querySelectorAll('p'));
-                      return ps.map(p => (p.textContent||'').trim()).filter(t => re.test(t)).length;
-                    }"""
-                )
-                if n != last:
-                    log.info("Trades time-cells detected: %s", n)
-                    last = n
-                if n and n >= 1:
-                    return
+            panel = page.locator("div[role='tabpanel'][id*='panel-orderHistory']")
+            if await panel.count() > 0:
+                visible_panel = None
+                for i in range(await panel.count()):
+                    p = panel.nth(i)
+                    if await p.is_visible():
+                        visible_panel = p
+                        break
+
+                if visible_panel is not None:
+                    handle = await visible_panel.element_handle()
+                    if handle:
+                        n = await handle.evaluate(
+                            """(root) => {
+                              const re = /^(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$/;
+                              const ps = Array.from(root.querySelectorAll('p'));
+                              return ps.map(p => (p.textContent||'').trim()).filter(t => re.test(t)).length;
+                            }"""
+                        )
+                        if n != last:
+                            log.info("Trades time-cells detected: %s", n)
+                            last = n
+                        if n and n >= 1:
+                            return
         except Exception:
             pass
+
+        # 2) один раз пробуем проскроллить и кликнуть вкладку
+        if not retried_click:
+            retried_click = True
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(600)
+            except Exception:
+                pass
+            try:
+                await click_trades_tab_best_effort(page)
+            except Exception:
+                pass
 
         await page.wait_for_timeout(800)
 
@@ -542,7 +611,6 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> bool:
         "Prefer": "resolution=merge-duplicates,return=minimal",
     }
 
-    # httpx берёт прокси из env если trust_env=True
     async with httpx.AsyncClient(timeout=35.0, headers=headers, trust_env=True) as client:
         resp = await client.post(url, content=json.dumps(rows, ensure_ascii=False).encode("utf-8"))
         if resp.status_code in (200, 201, 204):
@@ -554,17 +622,16 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> bool:
 # ───────────────────────── CORE ─────────────────────────
 
 async def _goto_fast(page: Page, url: str) -> None:
-    # намеренно НЕ ждём networkidle, чтобы не зависать на бесконечных websocket/фоновых запросах
+    # Важно: НЕ ждём networkidle (может зависать из-за websocket/фоновых запросов)
     await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
     await page.wait_for_timeout(800)
 
 async def run_once() -> List[Dict[str, Any]]:
-    proxy_url = _build_proxy_from_parts()
+    proxy_url = _build_proxy_url()
     pw_proxy = _parse_proxy_for_playwright(proxy_url) if proxy_url else None
 
     if proxy_url:
         u = urlsplit(proxy_url)
-        # безопасно: не печатаем пароль
         log.info("Proxy enabled: scheme=%s host=%s port=%s user=%s", u.scheme, u.hostname, u.port, u.username or "")
 
     async with async_playwright() as p:
@@ -684,7 +751,6 @@ async def main() -> None:
                 )
                 raise SystemExit(1)
 
-            # если где-то внезапно зависнет без таймаута — цикл будет оборван
             trades = await asyncio.wait_for(run_once(), timeout=CYCLE_HARD_TIMEOUT_SEC)
 
             now = time.time()
