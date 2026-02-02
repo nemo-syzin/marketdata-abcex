@@ -39,27 +39,23 @@ SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))
 WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "45000"))
 
-# sanity для USDT/RUB
 PRICE_MIN = Decimal(os.getenv("PRICE_MIN", "50"))
 PRICE_MAX = Decimal(os.getenv("PRICE_MAX", "200"))
 
-# Диагностика (включай при отладке)
 DIAG = os.getenv("DIAG", "0") == "1"
-DIAG_TEXT_CHARS = int(os.getenv("DIAG_TEXT_CHARS", "1400"))
+DIAG_TEXT_CHARS = int(os.getenv("DIAG_TEXT_CHARS", "1800"))
 
-# Render cache path
 BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
 
-# NEW: restart guard — if there was no successful DB upsert for too long, exit(1) so Render restarts worker
 STALL_RESTART_SECONDS = float(os.getenv("STALL_RESTART_SECONDS", "3600"))
+
+# Жёсткий лимит на один цикл (если внезапно повиснет где-то без таймаута)
+CYCLE_HARD_TIMEOUT_SEC = float(os.getenv("CYCLE_HARD_TIMEOUT_SEC", "210"))
 
 # ───────────────────────── LOGGING ─────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
 log = logging.getLogger("abcex")
 
 # ───────────────────────── INSTALL ─────────────────────────
@@ -129,8 +125,32 @@ def _should_force_install(err: Exception) -> bool:
 
 # ───────────────────────── PROXY ─────────────────────────
 
-def _get_proxy_url() -> Optional[str]:
-    return os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
+def _build_proxy_from_parts() -> Optional[str]:
+    """
+    Поддержка двух схем:
+    1) стандартные HTTP_PROXY / HTTPS_PROXY (приоритет)
+    2) PROXY_SERVER + PROXY_USERNAME + PROXY_PASSWORD
+       PROXY_SERVER пример: http://158.46.180.246:4948  или socks5://158.46.180.246:14948
+    """
+    std = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+    if std:
+        return std
+
+    server = os.getenv("PROXY_SERVER", "").strip()
+    user = os.getenv("PROXY_USERNAME", "").strip()
+    pw = os.getenv("PROXY_PASSWORD", "").strip()
+
+    if not server:
+        return None
+
+    u = urlsplit(server)
+    if u.scheme and u.hostname and u.port:
+        if user and pw:
+            return f"{u.scheme}://{user}:{pw}@{u.hostname}:{u.port}"
+        return server
+
+    # если server кривой/без схемы — вернём как есть (на риск пользователя)
+    return server
 
 def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
     u = urlsplit(proxy_url)
@@ -151,26 +171,16 @@ def _q8(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
 
 def _to_decimal_num(text: str) -> Decimal:
-    """
-    Понимает:
-      79.30
-      5,004.5041
-      10,734.6612
-      1 020.2238
-      1 020,2238
-    """
     t = (text or "").strip().replace("\xa0", " ")
     t = re.sub(r"[^0-9\s\.,-]", "", t)
     t = t.replace(" ", "")
     if not t:
         raise InvalidOperation("empty numeric")
 
-    # если есть и ',' и '.' -> считаем ',' разделителем тысяч
     if "," in t and "." in t:
         t = t.replace(",", "")
     else:
         t = t.replace(",", ".")
-
     return Decimal(t)
 
 def _is_valid_time(tt: str) -> bool:
@@ -198,7 +208,7 @@ async def log_diag(page: Page, tag: str) -> None:
     try:
         snippet = await page.evaluate(
             """(maxChars) => (document.body?.innerText || '').replace(/\\u00a0/g,' ').trim().slice(0, maxChars)""",
-            DIAG_TEXT_CHARS
+            DIAG_TEXT_CHARS,
         )
         log.warning("DIAG[%s] bodySnippet:\n%s", tag, snippet)
     except Exception as e:
@@ -213,7 +223,7 @@ async def accept_cookies_if_any(page: Page) -> None:
             if await btn.count() > 0 and await btn.first.is_visible():
                 log.info("Cookies banner: clicking '%s'...", txt)
                 await btn.first.click(timeout=5_000)
-                await page.wait_for_timeout(500)
+                await page.wait_for_timeout(300)
                 return
         except Exception:
             pass
@@ -243,7 +253,7 @@ async def _open_login_modal_if_needed(page: Page) -> None:
             btn = page.locator(sel)
             if await btn.count() > 0 and await btn.first.is_visible():
                 await btn.first.click(timeout=7_000)
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(600)
                 return
         except Exception:
             pass
@@ -275,6 +285,7 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
     submit = page.locator(
         "button[type='submit'], button:has-text('Войти'), button:has-text('Login'), button:has-text('Sign in')"
     ).first
+
     try:
         if await submit.is_visible():
             await submit.click(timeout=10_000)
@@ -286,18 +297,18 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
         except Exception:
             pass
 
-    await page.wait_for_timeout(1_000)
+    await page.wait_for_timeout(700)
 
-    for _ in range(60):
+    for _ in range(70):
         if not await _is_login_visible(page):
             log.info("Login successful (password field disappeared).")
             return
-        await page.wait_for_timeout(400)
+        await page.wait_for_timeout(350)
 
     await log_diag(page, "login_failed")
     raise RuntimeError("Логин не прошёл (форма логина всё ещё видна).")
 
-async def click_trades_tab_best_effort(page: Page) -> None:
+async def click_trades_tab_best_effort(page: Page) -> bool:
     candidates = ["Сделки", "Trades", "Order history", "История", "Последние сделки"]
     for t in candidates:
         for sel in [
@@ -310,27 +321,23 @@ async def click_trades_tab_best_effort(page: Page) -> None:
                 el = page.locator(sel).first
                 if await el.count() > 0 and await el.is_visible():
                     await el.click(timeout=8_000)
-                    await page.wait_for_timeout(900)
+                    await page.wait_for_timeout(700)
                     log.info("Clicked trades tab by '%s'.", t)
-                    return
+                    return True
             except Exception:
                 continue
+    log.warning("Could not click trades tab (no matching visible selector).")
+    return False
 
-# ───────────────────────── ORDER HISTORY PANEL (ВАЖНО) ─────────────────────────
+# ───────────────────────── ORDER HISTORY PANEL ─────────────────────────
 
 async def get_order_history_panel(page: Page) -> Locator:
-    """
-    По твоему скрину:
-      div[role='tabpanel'][id*='panel-orderHistory']
-    id динамический (mantine-XXXX-panel-orderHistory), поэтому берём contains.
-    """
     panel = page.locator("div[role='tabpanel'][id*='panel-orderHistory']")
     cnt = await panel.count()
     if cnt == 0:
         await log_diag(page, "no_orderHistory_panel")
         raise RuntimeError("Не нашёл tabpanel panel-orderHistory.")
 
-    # берём видимую
     for i in range(cnt):
         p = panel.nth(i)
         try:
@@ -345,9 +352,6 @@ async def get_order_history_panel(page: Page) -> Locator:
 # ───────────────────────── PARSING ─────────────────────────
 
 async def wait_trades_ready(page: Page, timeout_ms: int) -> None:
-    """
-    Ждём, пока в panel-orderHistory появятся p-элементы со временем HH:MM:SS
-    """
     start = time.time()
     last = -1
 
@@ -377,11 +381,6 @@ async def wait_trades_ready(page: Page, timeout_ms: int) -> None:
     raise RuntimeError("Не дождался появления сделок в panel-orderHistory (времени HH:MM:SS).")
 
 async def _extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str, Any]]:
-    """
-    Извлекаем сделки строго из panel-orderHistory.
-    Логика: ищем p со временем HH:MM:SS и берём два предыдущих числовых p (qty, price).
-    Это устойчиво к изменению div/grid вокруг (по твоему DOM так и идёт: price, qty, time).
-    """
     handle = await panel.element_handle()
     if handle is None:
         raise RuntimeError("Не смог получить element_handle панели orderHistory.")
@@ -396,12 +395,10 @@ async def _extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[st
 
           const out = [];
 
-          // идём слева-направо, ловим time, потом откатываемся назад за qty/price
           for (let i = 0; i < texts.length; i++) {
             const t = texts[i];
             if (!isTime(t)) continue;
 
-            // qty = ближайшее числовое p слева
             let qty = null;
             let qtyIdx = -1;
             for (let j = i - 1; j >= 0; j--) {
@@ -409,7 +406,6 @@ async def _extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[st
             }
             if (!qty) continue;
 
-            // price = ближайшее числовое p слева от qty
             let price = null;
             let priceIdx = -1;
             for (let j = qtyIdx - 1; j >= 0; j--) {
@@ -417,7 +413,6 @@ async def _extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[st
             }
             if (!price) continue;
 
-            // side (опционально): по inline style / class price-ячейки
             const el = ps[priceIdx];
             const style0 = ((el && el.getAttribute && el.getAttribute('style')) || '').toLowerCase();
             const cls0 = ((el && el.className) || '').toLowerCase();
@@ -431,7 +426,6 @@ async def _extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[st
             if (out.length >= limit) break;
           }
 
-          // убираем дубли (иногда time/qty/price встречаются в шапках/повторах)
           const seen = new Set();
           const uniq = [];
           for (const r of out) {
@@ -471,12 +465,10 @@ def _normalize_trade_row(r: Dict[str, Any]) -> Optional[Tuple[Decimal, Decimal, 
     side_s: Optional[str] = None
     if side in ("buy", "sell"):
         side_s = side
-
     return price, qty, tt, side_s
 
 async def extract_trades(page: Page, limit: int) -> List[Dict[str, Any]]:
     panel = await get_order_history_panel(page)
-
     raw_rows = await _extract_trades_from_panel(panel, limit=limit)
     log.info("DOM orderHistory rows found: %d", len(raw_rows))
 
@@ -499,7 +491,6 @@ async def extract_trades(page: Page, limit: int) -> List[Dict[str, Any]]:
             "volume_rub": str(vol_rub),
             "trade_time": tt,
         }
-        # side — если у тебя есть колонка (если нет — лучше не слать)
         if os.getenv("SEND_SIDE", "0") == "1":
             out["side"] = side
 
@@ -532,12 +523,12 @@ def trade_key(t: Dict[str, Any]) -> TradeKey:
         volume_usdt=str(t.get("volume_usdt", "")),
     )
 
-async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> None:
+async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> bool:
     if not rows:
-        return
+        return False
     if not SUPABASE_URL or not SUPABASE_KEY or not SUPABASE_TABLE:
         log.warning("Supabase env is not fully set; skipping DB write.")
-        return
+        return False
 
     url = (
         SUPABASE_URL.rstrip("/")
@@ -551,32 +542,30 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> None:
         "Prefer": "resolution=merge-duplicates,return=minimal",
     }
 
+    # httpx берёт прокси из env если trust_env=True
     async with httpx.AsyncClient(timeout=35.0, headers=headers, trust_env=True) as client:
         resp = await client.post(url, content=json.dumps(rows, ensure_ascii=False).encode("utf-8"))
         if resp.status_code in (200, 201, 204):
             log.info("Supabase upsert OK: %s trades", len(rows))
-            return
+            return True
         log.error("Supabase write failed: %s %s", resp.status_code, resp.text[:2000])
-        # NOTE: do not change existing logic; keep as-is (no raise)
+        return False
 
 # ───────────────────────── CORE ─────────────────────────
 
-async def _goto_stable(page: Page, url: str) -> None:
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
-    except Exception as e:
-        log.warning("goto failed (%s). retry with reload...", e)
-        await page.reload(wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
-
-    try:
-        await page.wait_for_load_state("networkidle", timeout=20_000)
-    except Exception:
-        pass
-    await page.wait_for_timeout(1_200)
+async def _goto_fast(page: Page, url: str) -> None:
+    # намеренно НЕ ждём networkidle, чтобы не зависать на бесконечных websocket/фоновых запросах
+    await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+    await page.wait_for_timeout(800)
 
 async def run_once() -> List[Dict[str, Any]]:
-    proxy_url = _get_proxy_url()
+    proxy_url = _build_proxy_from_parts()
     pw_proxy = _parse_proxy_for_playwright(proxy_url) if proxy_url else None
+
+    if proxy_url:
+        u = urlsplit(proxy_url)
+        # безопасно: не печатаем пароль
+        log.info("Proxy enabled: scheme=%s host=%s port=%s user=%s", u.scheme, u.hostname, u.port, u.username or "")
 
     async with async_playwright() as p:
         browser = None
@@ -597,7 +586,7 @@ async def run_once() -> List[Dict[str, Any]]:
                 break
             except Exception as e:
                 if _should_force_install(e):
-                    log.warning("Chromium launch failed; forcing install and retry... attempt=%s", attempt)
+                    log.warning("Chromium launch failed; forcing install and retry... attempt=%s err=%s", attempt, e)
                     ensure_playwright_browsers(force=True)
                     await asyncio.sleep(2.0 * attempt)
                     continue
@@ -627,29 +616,36 @@ async def run_once() -> List[Dict[str, Any]]:
         page.set_default_navigation_timeout(GOTO_TIMEOUT_MS)
 
         try:
-            log.info("Opening ABCEX: %s", ABCEX_URL)
-            await _goto_stable(page, ABCEX_URL)
+            log.info("STEP 1: open spot")
+            await _goto_fast(page, ABCEX_URL)
 
+            log.info("STEP 2: cookies")
             await accept_cookies_if_any(page)
+
+            log.info("STEP 3: login_if_needed")
             await login_if_needed(page, ABCEX_EMAIL, ABCEX_PASSWORD)
+            log.info("STEP 3b: url_after_login=%s", page.url)
 
-            # после логина — вернуться на spot
-            await _goto_stable(page, ABCEX_URL)
+            log.info("STEP 4: reopen spot after login")
+            await _goto_fast(page, ABCEX_URL)
 
+            log.info("STEP 5: save storage state")
             try:
                 await context.storage_state(path=STATE_PATH)
                 log.info("Saved session state to %s", STATE_PATH)
             except Exception as e:
                 log.warning("Could not save storage state: %s", e)
 
+            log.info("STEP 6: click trades tab")
             await click_trades_tab_best_effort(page)
 
             if DIAG:
                 await log_diag(page, "after_click_trades_tab")
 
-            # ключевое ожидание: именно в panel-orderHistory должны появиться HH:MM:SS
+            log.info("STEP 7: wait trades ready")
             await wait_trades_ready(page, timeout_ms=WAIT_TRADES_TIMEOUT_MS)
 
+            log.info("STEP 8: extract trades")
             trades = await extract_trades(page, limit=LIMIT)
             log.info("Parsed trades (validated): %d", len(trades))
 
@@ -663,18 +659,11 @@ async def run_once() -> List[Dict[str, Any]]:
             raise e
 
         finally:
-            try:
-                await page.close()
-            except Exception:
-                pass
-            try:
-                await context.close()
-            except Exception:
-                pass
-            try:
-                await browser.close()
-            except Exception:
-                pass
+            for obj in (page, context, browser):
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
 
 async def main() -> None:
     ensure_playwright_browsers(force=False)
@@ -682,22 +671,21 @@ async def main() -> None:
     seen: Dict[TradeKey, float] = {}
     seen_ttl = 60 * 30  # 30 минут
 
-    # NEW: track last successful upsert time; if too long -> exit(1) to trigger Render restart
     last_success_upsert = time.monotonic()
 
     while True:
         try:
-            # NEW: stall watchdog (based strictly on DB delivery, as requested)
             now_m = time.monotonic()
             if now_m - last_success_upsert >= STALL_RESTART_SECONDS:
                 log.error(
-                    "STALL: no successful DB upsert for %.0fs (threshold=%.0fs). Exiting(1) to trigger Render restart.",
+                    "STALL: no successful DB upsert for %.0fs (threshold=%.0fs). Exiting(1) to trigger restart.",
                     now_m - last_success_upsert,
                     STALL_RESTART_SECONDS,
                 )
                 raise SystemExit(1)
 
-            trades = await run_once()
+            # если где-то внезапно зависнет без таймаута — цикл будет оборван
+            trades = await asyncio.wait_for(run_once(), timeout=CYCLE_HARD_TIMEOUT_SEC)
 
             now = time.time()
             for k, ts in list(seen.items()):
@@ -713,19 +701,18 @@ async def main() -> None:
                 fresh.append(t)
 
             if fresh:
-                await supabase_upsert_trades(fresh)
-                # NEW: consider success only when we actually attempted to write "fresh" trades
-                # Note: supabase_upsert_trades keeps old behavior (no raise); we treat the cycle as successful
-                # only if response was OK. To keep your logic intact, we detect OK by re-calling the same endpoint
-                # is not acceptable. Therefore we update only when we *do* have fresh data and the function
-                # returned normally (as it did before).
-                last_success_upsert = time.monotonic()
+                ok = await supabase_upsert_trades(fresh)
+                if ok:
+                    last_success_upsert = time.monotonic()
             else:
                 log.info("No new trades after in-memory dedup.")
 
         except SystemExit:
-            # Let process exit so Render restarts background worker.
             raise
+
+        except asyncio.TimeoutError:
+            log.error("Cycle hard-timeout (%.0fs). Forcing restart to recover.", CYCLE_HARD_TIMEOUT_SEC)
+            raise SystemExit(1)
 
         except Exception as e:
             log.error("Cycle error: %s", e)
