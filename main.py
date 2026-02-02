@@ -12,11 +12,11 @@ import sys
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlsplit
 
 import httpx
-from playwright.async_api import async_playwright, Page, Locator
+from playwright.async_api import async_playwright, Page, Locator, Frame
 
 # ───────────────────────── CONFIG ─────────────────────────
 
@@ -36,20 +36,21 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
-GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))
-WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "45000"))
+GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "70000"))
+WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "55000"))
+WIDGET_READY_TIMEOUT_MS = int(os.getenv("WIDGET_READY_TIMEOUT_MS", "45000"))
 
 PRICE_MIN = Decimal(os.getenv("PRICE_MIN", "50"))
 PRICE_MAX = Decimal(os.getenv("PRICE_MAX", "200"))
 
 DIAG = os.getenv("DIAG", "0") == "1"
-DIAG_TEXT_CHARS = int(os.getenv("DIAG_TEXT_CHARS", "1800"))
+DIAG_TEXT_CHARS = int(os.getenv("DIAG_TEXT_CHARS", "2200"))
 
 BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
 
 STALL_RESTART_SECONDS = float(os.getenv("STALL_RESTART_SECONDS", "3600"))
-CYCLE_HARD_TIMEOUT_SEC = float(os.getenv("CYCLE_HARD_TIMEOUT_SEC", "240"))
+CYCLE_HARD_TIMEOUT_SEC = float(os.getenv("CYCLE_HARD_TIMEOUT_SEC", "260"))
 
 # ───────────────────────── LOGGING ─────────────────────────
 
@@ -83,10 +84,8 @@ def ensure_playwright_browsers(force: bool = False) -> None:
 
     max_attempts = 4
     for attempt in range(1, max_attempts + 1):
-        log.warning(
-            "Installing Playwright browsers (runtime) to %s ... force=%s attempt=%s/%s",
-            BROWSERS_ROOT, force, attempt, max_attempts
-        )
+        log.warning("Installing Playwright browsers to %s ... force=%s attempt=%s/%s",
+                    BROWSERS_ROOT, force, attempt, max_attempts)
         r = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium", "chromium-headless-shell"],
             check=False,
@@ -106,9 +105,7 @@ def ensure_playwright_browsers(force: bool = False) -> None:
             return
 
         if attempt < max_attempts:
-            sleep_s = 6 * attempt
-            log.warning("Install not complete yet. Sleeping %ss and retrying...", sleep_s)
-            time.sleep(sleep_s)
+            time.sleep(6 * attempt)
 
     raise RuntimeError("playwright install failed after retries")
 
@@ -124,12 +121,6 @@ def _should_force_install(err: Exception) -> bool:
 # ───────────────────────── PROXY ─────────────────────────
 
 def _build_proxy_url() -> Optional[str]:
-    """
-    Приоритет:
-    1) HTTPS_PROXY / HTTP_PROXY (стандартно)
-    2) PROXY_SERVER + PROXY_USERNAME + PROXY_PASSWORD
-       PROXY_SERVER пример: http://ip:port  или socks5://ip:port
-    """
     std = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
     if std:
         return std.strip()
@@ -167,14 +158,6 @@ def _q8(x: Decimal) -> Decimal:
     return x.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
 
 def _to_decimal_num(text: str) -> Decimal:
-    """
-    Понимает:
-      79.30
-      5,004.5041
-      10,734.6612
-      1 020.2238
-      1 020,2238
-    """
     t = (text or "").strip().replace("\xa0", " ")
     t = re.sub(r"[^0-9\s\.,-]", "", t)
     t = t.replace(" ", "")
@@ -195,28 +178,50 @@ def _price_ok(p: Decimal) -> bool:
 
 # ───────────────────────── DIAG ─────────────────────────
 
-async def log_diag(page: Page, tag: str) -> None:
+async def _diag_dump(ctx: Union[Page, Frame], tag: str) -> None:
+    if not DIAG:
+        return
+
+    try:
+        url = ctx.url if isinstance(ctx, Page) else ctx.url
+        log.warning("DIAG[%s] ctx_url=%s", tag, url)
+    except Exception:
+        pass
+
+    try:
+        txt = await ctx.evaluate(
+            """(maxChars) => (document.body?.innerText || '').replace(/\\u00a0/g,' ').trim().slice(0, maxChars)""",
+            DIAG_TEXT_CHARS,
+        )
+        log.warning("DIAG[%s] bodySnippet:\n%s", tag, txt)
+    except Exception as e:
+        log.warning("DIAG[%s] snippet failed: %s", tag, e)
+
+    try:
+        # ищем любые следы orderHistory / tab / trades в HTML
+        html = await ctx.evaluate("""() => document.documentElement?.outerHTML || ''""")
+        low = html.lower()
+        marks = []
+        for needle in ["orderhistory", "panel-orderhistory", "role=\"tab\"", "aria-controls", "mantine-"]:
+            marks.append(f"{needle}={'yes' if needle in low else 'no'}")
+        log.warning("DIAG[%s] html_marks: %s", tag, ", ".join(marks))
+    except Exception:
+        pass
+
+async def log_diag_page(page: Page, tag: str) -> None:
     if not DIAG:
         return
     try:
         frames = page.frames
-        log.warning("DIAG[%s] url=%s frames=%d", tag, page.url, len(frames))
-        for i, fr in enumerate(frames[:10]):
+        log.warning("DIAG[%s] page_url=%s frames=%d", tag, page.url, len(frames))
+        for i, fr in enumerate(frames[:12]):
             try:
                 log.warning("DIAG[%s] frame[%d] url=%s", tag, i, fr.url)
             except Exception:
                 pass
-    except Exception as e:
-        log.warning("DIAG[%s] frames failed: %s", tag, e)
-
-    try:
-        snippet = await page.evaluate(
-            """(maxChars) => (document.body?.innerText || '').replace(/\\u00a0/g,' ').trim().slice(0, maxChars)""",
-            DIAG_TEXT_CHARS,
-        )
-        log.warning("DIAG[%s] bodySnippet:\n%s", tag, snippet)
-    except Exception as e:
-        log.warning("DIAG[%s] snippet failed: %s", tag, e)
+    except Exception:
+        pass
+    await _diag_dump(page, tag)
 
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
@@ -225,7 +230,6 @@ async def accept_cookies_if_any(page: Page) -> None:
         try:
             btn = page.locator(f"text={txt}")
             if await btn.count() > 0 and await btn.first.is_visible():
-                log.info("Cookies banner: clicking '%s'...", txt)
                 await btn.first.click(timeout=5_000)
                 await page.wait_for_timeout(300)
                 return
@@ -243,15 +247,9 @@ async def _open_login_modal_if_needed(page: Page) -> None:
     if await _is_login_visible(page):
         return
     for sel in [
-        "button:has-text('Войти')",
-        "a:has-text('Войти')",
-        "text=Войти",
-        "button:has-text('Login')",
-        "a:has-text('Login')",
-        "text=Login",
-        "button:has-text('Sign in')",
-        "a:has-text('Sign in')",
-        "text=Sign in",
+        "button:has-text('Войти')", "a:has-text('Войти')", "text=Войти",
+        "button:has-text('Login')", "a:has-text('Login')", "text=Login",
+        "button:has-text('Sign in')", "a:has-text('Sign in')", "text=Sign in",
     ]:
         try:
             btn = page.locator(sel)
@@ -280,7 +278,7 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
     pw_loc = page.locator("input[type='password'], input[autocomplete='current-password']").first
 
     if not await email_loc.is_visible() or not await pw_loc.is_visible():
-        await log_diag(page, "login_fields_not_visible")
+        await log_diag_page(page, "login_fields_not_visible")
         raise RuntimeError("Не смог найти/увидеть поля email/password.")
 
     await email_loc.fill(email, timeout=10_000)
@@ -303,85 +301,131 @@ async def login_if_needed(page: Page, email: str, password: str) -> None:
 
     await page.wait_for_timeout(700)
 
-    for _ in range(70):
+    for _ in range(80):
         if not await _is_login_visible(page):
             log.info("Login successful (password field disappeared).")
             return
         await page.wait_for_timeout(350)
 
-    await log_diag(page, "login_failed")
+    await log_diag_page(page, "login_failed")
     raise RuntimeError("Логин не прошёл (форма логина всё ещё видна).")
 
-async def click_trades_tab_best_effort(page: Page) -> bool:
-    # часто табы ниже, поэтому скроллим
+# ───────────────────────── FIND CONTEXT (PAGE OR FRAME) ─────────────────────────
+
+async def _find_ctx_with_orderhistory(page: Page) -> Optional[Union[Page, Frame]]:
+    # 1) page
     try:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(500)
+        if await page.locator("div[role='tabpanel'][id*='panel-orderHistory']").count() > 0:
+            return page
+        if await page.locator("[aria-controls*='panel-orderHistory']").count() > 0:
+            return page
+        if await page.locator("[id*='tab-orderHistory'], [id*='tab-orderhistory']").count() > 0:
+            return page
     except Exception:
         pass
 
-    candidates = ["Trades", "Сделки", "Order history", "История", "Последние сделки"]
-
-    # 1) role=tab
-    for name in candidates:
+    # 2) frames
+    for fr in page.frames:
         try:
-            tab = page.get_by_role("tab", name=name)
-            if await tab.count() > 0:
-                await tab.first.scroll_into_view_if_needed(timeout=5_000)
-                await tab.first.click(timeout=8_000)
-                await page.wait_for_timeout(700)
-                log.info("Clicked trades tab by role(tab) '%s'.", name)
-                return True
+            if not fr.url:
+                continue
+            if await fr.locator("div[role='tabpanel'][id*='panel-orderHistory']").count() > 0:
+                return fr
+            if await fr.locator("[aria-controls*='panel-orderHistory']").count() > 0:
+                return fr
+            if await fr.locator("[id*='tab-orderHistory'], [id*='tab-orderhistory']").count() > 0:
+                return fr
+        except Exception:
+            continue
+
+    return None
+
+async def wait_widget_ready(page: Page, timeout_ms: int) -> Union[Page, Frame]:
+    start = time.time()
+    last_diag = 0.0
+    while (time.time() - start) * 1000 < timeout_ms:
+        ctx = await _find_ctx_with_orderhistory(page)
+        if ctx is not None:
+            return ctx
+
+        # иногда помогет скролл (появляются элементы)
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         except Exception:
             pass
 
-    # 2) текстовый клик (force)
-    for name in candidates:
+        # не спамим DIAG
+        if DIAG and (time.time() - last_diag) > 10:
+            last_diag = time.time()
+            await log_diag_page(page, "widget_not_ready_yet")
+
+        await page.wait_for_timeout(900)
+
+    await log_diag_page(page, "widget_ready_timeout")
+    raise RuntimeError("Не дождался появления UI для orderHistory (ни на странице, ни во фреймах).")
+
+# ───────────────────────── OPEN ORDER HISTORY TAB ─────────────────────────
+
+async def open_order_history_tab(ctx: Union[Page, Frame]) -> bool:
+    # 1) самый правильный путь: клик по элементу, который управляет panel-orderHistory
+    #    (aria-controls="mantine-xxx-panel-orderHistory")
+    selectors = [
+        "[role='tab'][aria-controls*='panel-orderHistory']",
+        "button[aria-controls*='panel-orderHistory']",
+        "a[aria-controls*='panel-orderHistory']",
+        "[aria-controls*='panel-orderHistory']",
+        "[id*='tab-orderHistory']",
+        "[id*='tab-orderhistory']",
+    ]
+
+    for sel in selectors:
         try:
-            el = page.locator(f":text('{name}')").first
+            el = ctx.locator(sel).first
             if await el.count() > 0:
-                await el.scroll_into_view_if_needed(timeout=5_000)
-                await el.click(timeout=8_000, force=True)
-                await page.wait_for_timeout(700)
-                log.info("Clicked trades tab by text '%s' (force).", name)
+                try:
+                    await el.scroll_into_view_if_needed(timeout=5_000)
+                except Exception:
+                    pass
+                try:
+                    await el.click(timeout=8_000)
+                except Exception:
+                    await el.click(timeout=8_000, force=True)
+                await (ctx.page.wait_for_timeout(700) if isinstance(ctx, Frame) else ctx.wait_for_timeout(700))
+                log.info("Clicked orderHistory controller via selector: %s", sel)
                 return True
         except Exception:
-            pass
+            continue
 
-    # 3) JS fallback
+    # 2) JS fallback: кликаем первый элемент с aria-controls*panel-orderHistory
     try:
-        ok = await page.evaluate(
-            """(names) => {
-              const norm = (s) => (s||'').trim().toLowerCase();
-              const want = new Set(names.map(norm));
-              const els = Array.from(document.querySelectorAll('button,a,[role="tab"],div,span'));
-              for (const el of els) {
-                const t = norm(el.textContent);
-                if (!t) continue;
-                if (want.has(t)) { el.click(); return true; }
-              }
-              return false;
-            }""",
-            candidates,
+        ok = await ctx.evaluate(
+            """() => {
+              const el = document.querySelector('[aria-controls*="panel-orderHistory"]');
+              if (!el) return false;
+              el.click();
+              return true;
+            }"""
         )
         if ok:
-            await page.wait_for_timeout(700)
-            log.info("Clicked trades tab by JS fallback.")
+            await (ctx.page.wait_for_timeout(700) if isinstance(ctx, Frame) else ctx.wait_for_timeout(700))
+            log.info("Clicked orderHistory via JS fallback.")
             return True
     except Exception:
         pass
 
-    log.warning("Could not click trades tab (no matching selector).")
+    log.warning("Could not click orderHistory tab/controller (no matching selector).")
     return False
 
 # ───────────────────────── ORDER HISTORY PANEL ─────────────────────────
 
-async def get_order_history_panel(page: Page) -> Locator:
-    panel = page.locator("div[role='tabpanel'][id*='panel-orderHistory']")
+def _panel_locator(ctx: Union[Page, Frame]) -> Locator:
+    return ctx.locator("div[role='tabpanel'][id*='panel-orderHistory']")
+
+async def get_visible_order_history_panel(ctx: Union[Page, Frame]) -> Locator:
+    panel = _panel_locator(ctx)
     cnt = await panel.count()
     if cnt == 0:
-        await log_diag(page, "no_orderHistory_panel")
-        raise RuntimeError("Не нашёл tabpanel panel-orderHistory.")
+        raise RuntimeError("Не нашёл div[role=tabpanel][id*='panel-orderHistory'].")
 
     for i in range(cnt):
         p = panel.nth(i)
@@ -391,62 +435,64 @@ async def get_order_history_panel(page: Page) -> Locator:
         except Exception:
             continue
 
-    await log_diag(page, "no_visible_orderHistory_panel")
-    raise RuntimeError("tabpanel panel-orderHistory найден, но ни один не видим.")
+    raise RuntimeError("Нашёл panel-orderHistory, но ни один tabpanel не видим.")
 
 # ───────────────────────── PARSING ─────────────────────────
 
-async def wait_trades_ready(page: Page, timeout_ms: int) -> None:
+async def wait_trades_ready(ctx: Union[Page, Frame], timeout_ms: int) -> None:
     start = time.time()
     last = -1
-    retried_click = False
+    tried_open = False
+    tried_reload = False
 
     while (time.time() - start) * 1000 < timeout_ms:
-        # 1) пытаемся найти панель (вдруг она уже активна)
+        # пробуем увидеть панель
         try:
-            panel = page.locator("div[role='tabpanel'][id*='panel-orderHistory']")
-            if await panel.count() > 0:
-                visible_panel = None
-                for i in range(await panel.count()):
-                    p = panel.nth(i)
-                    if await p.is_visible():
-                        visible_panel = p
-                        break
+            panel_any = _panel_locator(ctx)
+            if await panel_any.count() == 0:
+                # на некоторых рендерах панель создаётся только после клика
+                if not tried_open:
+                    tried_open = True
+                    await open_order_history_tab(ctx)
+                    await asyncio.sleep(0.6)
+                else:
+                    # если панель вообще не появляется — один раз reload
+                    if not tried_reload and isinstance(ctx, Page):
+                        tried_reload = True
+                        log.warning("orderHistory panel not present. Reloading page once...")
+                        await ctx.reload(wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
+                        await ctx.wait_for_timeout(1200)
+                    await asyncio.sleep(0.7)
+                continue
 
-                if visible_panel is not None:
-                    handle = await visible_panel.element_handle()
-                    if handle:
-                        n = await handle.evaluate(
-                            """(root) => {
-                              const re = /^(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$/;
-                              const ps = Array.from(root.querySelectorAll('p'));
-                              return ps.map(p => (p.textContent||'').trim()).filter(t => re.test(t)).length;
-                            }"""
-                        )
-                        if n != last:
-                            log.info("Trades time-cells detected: %s", n)
-                            last = n
-                        if n and n >= 1:
-                            return
+            panel = await get_visible_order_history_panel(ctx)
+            handle = await panel.element_handle()
+            if handle:
+                n = await handle.evaluate(
+                    """(root) => {
+                      const re = /^(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$/;
+                      const ps = Array.from(root.querySelectorAll('p'));
+                      return ps.map(p => (p.textContent||'').trim()).filter(t => re.test(t)).length;
+                    }"""
+                )
+                if n != last:
+                    log.info("Trades time-cells detected: %s", n)
+                    last = n
+                if n and n >= 1:
+                    return
         except Exception:
             pass
 
-        # 2) один раз пробуем проскроллить и кликнуть вкладку
-        if not retried_click:
-            retried_click = True
-            try:
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(600)
-            except Exception:
-                pass
-            try:
-                await click_trades_tab_best_effort(page)
-            except Exception:
-                pass
+        if not tried_open:
+            tried_open = True
+            await open_order_history_tab(ctx)
 
-        await page.wait_for_timeout(800)
+        await (ctx.page.wait_for_timeout(800) if isinstance(ctx, Frame) else ctx.wait_for_timeout(800))
 
-    await log_diag(page, "trades_not_ready_timeout")
+    if isinstance(ctx, Frame):
+        await _diag_dump(ctx, "trades_not_ready_timeout_frame")
+    else:
+        await log_diag_page(ctx, "trades_not_ready_timeout_page")
     raise RuntimeError("Не дождался появления сделок в panel-orderHistory (времени HH:MM:SS).")
 
 async def _extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[str, Any]]:
@@ -491,7 +537,6 @@ async def _extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[st
             if (style0.includes('red')   || cls0.includes('red'))   side = 'sell';
 
             out.push({ price_raw: price, qty_raw: qty, time: t, side });
-
             if (out.length >= limit) break;
           }
 
@@ -536,8 +581,8 @@ def _normalize_trade_row(r: Dict[str, Any]) -> Optional[Tuple[Decimal, Decimal, 
         side_s = side
     return price, qty, tt, side_s
 
-async def extract_trades(page: Page, limit: int) -> List[Dict[str, Any]]:
-    panel = await get_order_history_panel(page)
+async def extract_trades(ctx: Union[Page, Frame], limit: int) -> List[Dict[str, Any]]:
+    panel = await get_visible_order_history_panel(ctx)
     raw_rows = await _extract_trades_from_panel(panel, limit=limit)
     log.info("DOM orderHistory rows found: %d", len(raw_rows))
 
@@ -549,6 +594,7 @@ async def extract_trades(page: Page, limit: int) -> List[Dict[str, Any]]:
         if not parsed:
             rejected += 1
             continue
+
         price, vol_usdt, tt, side = parsed
         vol_rub = _q8(price * vol_usdt)
 
@@ -566,10 +612,10 @@ async def extract_trades(page: Page, limit: int) -> List[Dict[str, Any]]:
         rows.append(out)
 
     if rejected:
-        log.info("Rejected rows (failed parse/sanity): %s", rejected)
+        log.info("Rejected rows: %s", rejected)
 
-    if not rows:
-        await log_diag(page, "extract_trades_zero")
+    if not rows and DIAG:
+        await _diag_dump(ctx, "extract_trades_zero")
 
     return rows
 
@@ -621,10 +667,9 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> bool:
 
 # ───────────────────────── CORE ─────────────────────────
 
-async def _goto_fast(page: Page, url: str) -> None:
-    # Важно: НЕ ждём networkidle (может зависать из-за websocket/фоновых запросов)
+async def _goto_dom(page: Page, url: str) -> None:
     await page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
-    await page.wait_for_timeout(800)
+    await page.wait_for_timeout(1200)
 
 async def run_once() -> List[Dict[str, Any]]:
     proxy_url = _build_proxy_url()
@@ -684,7 +729,7 @@ async def run_once() -> List[Dict[str, Any]]:
 
         try:
             log.info("STEP 1: open spot")
-            await _goto_fast(page, ABCEX_URL)
+            await _goto_dom(page, ABCEX_URL)
 
             log.info("STEP 2: cookies")
             await accept_cookies_if_any(page)
@@ -694,7 +739,7 @@ async def run_once() -> List[Dict[str, Any]]:
             log.info("STEP 3b: url_after_login=%s", page.url)
 
             log.info("STEP 4: reopen spot after login")
-            await _goto_fast(page, ABCEX_URL)
+            await _goto_dom(page, ABCEX_URL)
 
             log.info("STEP 5: save storage state")
             try:
@@ -703,40 +748,46 @@ async def run_once() -> List[Dict[str, Any]]:
             except Exception as e:
                 log.warning("Could not save storage state: %s", e)
 
-            log.info("STEP 6: click trades tab")
-            await click_trades_tab_best_effort(page)
+            log.info("STEP 6: wait widget ready (page or frame)")
+            ctx = await wait_widget_ready(page, timeout_ms=WIDGET_READY_TIMEOUT_MS)
 
-            if DIAG:
-                await log_diag(page, "after_click_trades_tab")
+            log.info("STEP 7: open orderHistory")
+            await open_order_history_tab(ctx)
 
-            log.info("STEP 7: wait trades ready")
-            await wait_trades_ready(page, timeout_ms=WAIT_TRADES_TIMEOUT_MS)
+            log.info("STEP 8: wait trades ready")
+            await wait_trades_ready(ctx, timeout_ms=WAIT_TRADES_TIMEOUT_MS)
 
-            log.info("STEP 8: extract trades")
-            trades = await extract_trades(page, limit=LIMIT)
+            log.info("STEP 9: extract trades")
+            trades = await extract_trades(ctx, limit=LIMIT)
             log.info("Parsed trades (validated): %d", len(trades))
-
             for i, t in enumerate(trades[:3]):
                 log.info("Sample trade[%d]: %s", i, t)
 
             return trades
 
         except Exception as e:
-            await log_diag(page, "cycle_error")
+            await log_diag_page(page, "cycle_error")
             raise e
 
         finally:
-            for obj in (page, context, browser):
-                try:
-                    await obj.close()
-                except Exception:
-                    pass
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 async def main() -> None:
     ensure_playwright_browsers(force=False)
 
     seen: Dict[TradeKey, float] = {}
-    seen_ttl = 60 * 30  # 30 минут
+    seen_ttl = 60 * 30
 
     last_success_upsert = time.monotonic()
 
@@ -744,11 +795,7 @@ async def main() -> None:
         try:
             now_m = time.monotonic()
             if now_m - last_success_upsert >= STALL_RESTART_SECONDS:
-                log.error(
-                    "STALL: no successful DB upsert for %.0fs (threshold=%.0fs). Exiting(1) to trigger restart.",
-                    now_m - last_success_upsert,
-                    STALL_RESTART_SECONDS,
-                )
+                log.error("STALL: no successful DB upsert for %.0fs. Exiting(1) to restart.", now_m - last_success_upsert)
                 raise SystemExit(1)
 
             trades = await asyncio.wait_for(run_once(), timeout=CYCLE_HARD_TIMEOUT_SEC)
@@ -777,7 +824,7 @@ async def main() -> None:
             raise
 
         except asyncio.TimeoutError:
-            log.error("Cycle hard-timeout (%.0fs). Forcing restart to recover.", CYCLE_HARD_TIMEOUT_SEC)
+            log.error("Cycle hard-timeout (%.0fs). Exiting(1) to restart.", CYCLE_HARD_TIMEOUT_SEC)
             raise SystemExit(1)
 
         except Exception as e:
