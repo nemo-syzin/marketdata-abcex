@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import httpx
-from playwright.async_api import async_playwright, Page, Locator, Browser, BrowserContext, Frame
+from playwright.async_api import async_playwright, Page, Locator, Browser, BrowserContext
 
 # ───────────────────────── CONFIG ─────────────────────────
 
@@ -37,10 +37,10 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "exchange_trades")
 
 GOTO_TIMEOUT_MS = int(os.getenv("GOTO_TIMEOUT_MS", "60000"))
-WAIT_UI_TIMEOUT_MS = int(os.getenv("WAIT_UI_TIMEOUT_MS", "60000"))        # чуть больше
+WAIT_UI_TIMEOUT_MS = int(os.getenv("WAIT_UI_TIMEOUT_MS", "65000"))
 WAIT_TRADES_TIMEOUT_MS = int(os.getenv("WAIT_TRADES_TIMEOUT_MS", "45000"))
 
-# sanity для USDT/RUB
+# sanity for USDT/RUB
 PRICE_MIN = Decimal(os.getenv("PRICE_MIN", "50"))
 PRICE_MAX = Decimal(os.getenv("PRICE_MAX", "200"))
 
@@ -48,18 +48,18 @@ PRICE_MAX = Decimal(os.getenv("PRICE_MAX", "200"))
 BROWSERS_ROOT = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_ROOT
 
-# watchdog: если долго нет УСПЕШНОГО upsert-а — падаем, Render перезапустит
+# watchdog: if no successful upsert for too long — exit(1), Render restarts worker
 STALL_RESTART_SECONDS = float(os.getenv("STALL_RESTART_SECONDS", "3600"))
 
-# Диагностика HTML при проблемах
+# Diagnostics
 DIAG_TEXT_CHARS = int(os.getenv("DIAG_TEXT_CHARS", "2500"))
 
-# Прокси:
-# - HTTP_PROXY / HTTPS_PROXY
-# - SOCKS_PROXY (socks5://user:pass@host:port) — опционально
-# - PROXY_MODE=auto|force|off
+# Proxy mode: auto|force|off
 PROXY_MODE = os.getenv("PROXY_MODE", "auto").strip().lower()
-SOCKS_PROXY = os.getenv("SOCKS_PROXY", "").strip()  # optional
+SOCKS_PROXY = os.getenv("SOCKS_PROXY", "").strip()
+
+# Optional: if you KNOW abc-ex sometimes blocks your proxy, allow direct fallback even in force-mode
+ALLOW_DIRECT_FALLBACK = os.getenv("ALLOW_DIRECT_FALLBACK", "1") == "1"
 
 # ───────────────────────── LOGGING ─────────────────────────
 
@@ -148,7 +148,7 @@ def _parse_proxy_for_playwright(proxy_url: str) -> Dict[str, Any]:
 
 def _log_proxy(proxy_url: Optional[str], tag: str) -> None:
     if not proxy_url:
-        log.info("%s: proxy=OFF", tag)
+        log.info("%s: proxy=OFF (forced direct)", tag)
         return
     u = urlsplit(proxy_url)
     log.info("%s: proxy=ON scheme=%s host=%s port=%s user=%s", tag, u.scheme, u.hostname, u.port, u.username or "")
@@ -166,7 +166,6 @@ def _to_decimal_num(text: str) -> Decimal:
     t = t.replace(" ", "")
     if not t:
         raise InvalidOperation("empty numeric")
-
     if "," in t and "." in t:
         t = t.replace(",", "")
     else:
@@ -198,18 +197,28 @@ async def log_diag(page: Page, tag: str, net_errors: List[str], console_errors: 
     snippet = await _html_snippet(page)
     low = (snippet or "").lower()
     hints = []
-    for h in ["cloudflare", "captcha", "attention required", "access denied", "verify you are human", "blocked"]:
+    for h in ["cloudflare", "captcha", "attention required", "access denied", "verify you are human", "blocked", "bot"]:
         if h in low:
             hints.append(h)
 
     log.warning("DIAG[%s] url=%s hints=%s", tag, page.url, hints)
     if console_errors:
-        log.warning("DIAG[%s] console_errors_tail:\n%s", tag, "\n".join(console_errors[-15:]))
+        log.warning("DIAG[%s] console_errors_tail:\n%s", tag, "\n".join(console_errors[-20:]))
     if net_errors:
-        log.warning("DIAG[%s] net_errors_tail:\n%s", tag, "\n".join(net_errors[-15:]))
+        log.warning("DIAG[%s] net_errors_tail:\n%s", tag, "\n".join(net_errors[-20:]))
 
     if snippet:
         log.warning("DIAG[%s] html_snippet(first %d):\n----\n%s\n----", tag, DIAG_TEXT_CHARS, snippet)
+
+def _looks_like_proxy_error_line(s: str) -> bool:
+    s = (s or "").lower()
+    return (
+        "407" in s
+        or "proxy authentication" in s
+        or "err_tunnel_connection_failed" in s
+        or "tunnel connection failed" in s
+        or "proxy" in s and "required" in s
+    )
 
 # ───────────────────────── PAGE ACTIONS ─────────────────────────
 
@@ -309,12 +318,11 @@ async def _goto_stable(page: Page, url: str) -> None:
 
 # ───────────────────────── UI / PANEL SEARCH (PAGE + FRAMES) ─────────────────────────
 
-# максимально широкий набор (mantine / microfrontend / разные версии)
+# IMPORTANT: keep it narrow-ish; wide [id*='orderHistory'] was catching wrong container
 PANEL_CANDIDATES = [
-    "div[role='tabpanel'][id*='panel-orderHistory']",
     "div[id*='panel-orderHistory']",
-    "div[id*='orderHistory']",
-    "[id*='orderHistory']",
+    "div[role='tabpanel'][id*='orderHistory']",
+    "div[id*='orderHistory'][role='tabpanel']",
 ]
 
 TRADE_TAB_TEXTS = ["Trades", "Сделки", "Order history", "История", "Последние сделки"]
@@ -357,16 +365,53 @@ async def _try_click_trades_anywhere(page: Page) -> bool:
 
     return False
 
-async def _find_panel(page: Page) -> Optional[Tuple[Locator, Any, str]]:
+async def _panel_score(panel: Locator) -> int:
+    """
+    Score a candidate panel by how many time-like cells it already contains.
+    This avoids selecting a wrong wrapper with id*='orderHistory' but no trades.
+    """
+    try:
+        handle = await panel.element_handle()
+        if not handle:
+            return 0
+        n = await handle.evaluate(
+            """(root) => {
+              const re = /^(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?$/;
+              const nodes = Array.from(root.querySelectorAll('p,span,div'));
+              const texts = nodes.map(n => (n.textContent||'').replace(/\\u00a0/g,' ').trim());
+              let c = 0;
+              for (const t of texts) if (re.test(t)) c++;
+              return c;
+            }"""
+        )
+        return int(n or 0)
+    except Exception:
+        return 0
+
+async def _find_best_panel(page: Page) -> Optional[Tuple[Locator, Any, str, int]]:
+    best: Optional[Tuple[Locator, Any, str, int]] = None
+
+    async def consider(loc: Locator, scope: Any, sel: str) -> None:
+        nonlocal best
+        try:
+            cnt = await loc.count()
+        except Exception:
+            return
+        for i in range(cnt):
+            p = loc.nth(i)
+            try:
+                if not await p.is_visible():
+                    continue
+            except Exception:
+                continue
+            score = await _panel_score(p)
+            if best is None or score > best[3]:
+                best = (p, scope, sel, score)
+
     # main page
     for sel in PANEL_CANDIDATES:
         try:
-            loc = page.locator(sel)
-            if await loc.count() > 0:
-                for i in range(await loc.count()):
-                    p = loc.nth(i)
-                    if await p.is_visible():
-                        return p, page, sel
+            await consider(page.locator(sel), page, sel)
         except Exception:
             pass
 
@@ -376,26 +421,21 @@ async def _find_panel(page: Page) -> Optional[Tuple[Locator, Any, str]]:
             continue
         for sel in PANEL_CANDIDATES:
             try:
-                loc = fr.locator(sel)
-                if await loc.count() > 0:
-                    for i in range(await loc.count()):
-                        p = loc.nth(i)
-                        if await p.is_visible():
-                            return p, fr, sel
+                await consider(fr.locator(sel), fr, sel)
             except Exception:
                 pass
 
-    return None
+    return best
 
 async def wait_ui_ready(page: Page, timeout_ms: int) -> Tuple[Locator, Any]:
     start = time.time()
     last_try = 0.0
 
     while (time.time() - start) * 1000 < timeout_ms:
-        found = await _find_panel(page)
-        if found:
-            panel, scope, sel = found
-            log.info("UI ready: panel found by selector=%s", sel)
+        best = await _find_best_panel(page)
+        if best:
+            panel, scope, sel, score = best
+            log.info("UI ready: best panel selector=%s score=%d", sel, score)
             return panel, scope
 
         now = time.time()
@@ -405,7 +445,7 @@ async def wait_ui_ready(page: Page, timeout_ms: int) -> Tuple[Locator, Any]:
                 log.warning("Could not click trades tab (no matching selector).")
             last_try = now
 
-        await page.wait_for_timeout(600)
+        await page.wait_for_timeout(650)
 
     raise RuntimeError("UI_not_ready_timeout")
 
@@ -419,18 +459,23 @@ async def wait_trades_ready(panel: Locator, timeout_ms: int) -> None:
             if handle:
                 n = await handle.evaluate(
                     """(root) => {
-                      const re = /^(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$/;
-                      const ps = Array.from(root.querySelectorAll('p'));
-                      return ps.map(p => (p.textContent||'').trim()).filter(t => re.test(t)).length;
+                      const re = /^(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?$/;
+                      const nodes = Array.from(root.querySelectorAll('p,span,div'));
+                      const texts = nodes.map(n => (n.textContent||'').replace(/\\u00a0/g,' ').trim());
+                      let c = 0;
+                      for (const t of texts) if (re.test(t)) c++;
+                      return c;
                     }"""
                 )
+                n = int(n or 0)
                 if n != last:
                     log.info("Trades time-cells detected: %s", n)
                     last = n
-                if n and n >= 1:
+                if n >= 1:
                     return
         except Exception:
             pass
+
         await asyncio.sleep(0.8)
 
     raise RuntimeError("Trades_not_ready_timeout")
@@ -444,11 +489,11 @@ async def _extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[st
 
     raw_rows: List[Dict[str, Any]] = await handle.evaluate(
         """(root, limit) => {
-          const isTime = (s) => /^(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d$/.test((s||'').trim());
+          const isTime = (s) => /^(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d)?$/.test((s||'').trim());
           const isNum  = (s) => /^[0-9][0-9\\s\\u00A0.,]*$/.test((s||'').trim());
 
-          const ps = Array.from(root.querySelectorAll('p'));
-          const texts = ps.map(p => (p.textContent || '').replace(/\\u00A0/g,' ').trim());
+          const nodes = Array.from(root.querySelectorAll('p,span,div'));
+          const texts = nodes.map(n => (n.textContent || '').replace(/\\u00A0/g,' ').trim());
 
           const out = [];
           for (let i = 0; i < texts.length; i++) {
@@ -461,9 +506,9 @@ async def _extract_trades_from_panel(panel: Locator, limit: int) -> List[Dict[st
             }
             if (!qty) continue;
 
-            let price = null, priceIdx = -1;
+            let price = null;
             for (let j = qtyIdx - 1; j >= 0; j--) {
-              if (isNum(texts[j])) { price = texts[j]; priceIdx = j; break; }
+              if (isNum(texts[j])) { price = texts[j]; break; }
             }
             if (!price) continue;
 
@@ -575,7 +620,7 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> bool:
         "Prefer": "resolution=merge-duplicates,return=minimal",
     }
 
-    # Supabase НЕ через прокси
+    # IMPORTANT: do NOT trust env proxy for Supabase requests
     async with httpx.AsyncClient(timeout=35.0, headers=headers, trust_env=False) as client:
         resp = await client.post(url, content=json.dumps(rows, ensure_ascii=False).encode("utf-8"))
         if resp.status_code in (200, 201, 204):
@@ -584,7 +629,7 @@ async def supabase_upsert_trades(rows: List[Dict[str, Any]]) -> bool:
         log.error("Supabase write failed: %s %s", resp.status_code, resp.text[:2000])
         return False
 
-# ───────────────────────── WORKER (NO FULL GOTO EACH CYCLE) ─────────────────────────
+# ───────────────────────── WORKER ─────────────────────────
 
 class AbcexWorker:
     def __init__(self) -> None:
@@ -603,19 +648,21 @@ class AbcexWorker:
         if PROXY_MODE == "off":
             return [None]
         if PROXY_MODE == "force":
-            chain = []
+            chain: List[Optional[str]] = []
             if http_p:
                 chain.append(http_p)
-            if socks_p:
+            if socks_p and socks_p not in chain:
                 chain.append(socks_p)
+            if ALLOW_DIRECT_FALLBACK:
+                chain.append(None)
             return chain or [None]
 
-        chain = []
+        chain: List[Optional[str]] = []
         if http_p:
             chain.append(http_p)
         if socks_p and socks_p not in chain:
             chain.append(socks_p)
-        chain.append(None)
+        chain.append(None)  # direct fallback
         return chain
 
     async def close(self) -> None:
@@ -654,8 +701,16 @@ class AbcexWorker:
                 "--disable-dev-shm-usage",
             ],
         }
+
         if proxy_url:
             kwargs["proxy"] = _parse_proxy_for_playwright(proxy_url)
+        else:
+            # CRITICAL: force direct (ignore any env/system proxy), otherwise you'll get 407 even in "OFF"
+            kwargs["args"] += [
+                "--no-proxy-server",
+                "--proxy-server=direct://",
+                "--proxy-bypass-list=*",
+            ]
 
         self.browser = await p.chromium.launch(**kwargs)
 
@@ -675,10 +730,11 @@ class AbcexWorker:
             storage_state=storage_state,
         )
 
-        # режем тяжёлое
+        # Block heavy assets (but KEEP JS/CSS!)
         async def _route_handler(route, request):
             url = request.url.lower()
-            if any(url.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".woff", ".woff2", ".ttf", ".otf"]):
+            if any(url.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+                                                ".woff", ".woff2", ".ttf", ".otf"]):
                 return await route.abort()
             return await route.continue_()
         await self.context.route("**/*", _route_handler)
@@ -687,12 +743,19 @@ class AbcexWorker:
         self.page.set_default_timeout(20_000)
         self.page.set_default_navigation_timeout(GOTO_TIMEOUT_MS)
 
-        # лог сетевых проблем по JS/CSS
         def _is_asset(u: str) -> bool:
             u = (u or "").lower()
             return (".js" in u) or (".css" in u)
 
-        self.page.on("console", lambda m: self.console_errors.append(f"{m.type}: {m.text}") if m.type in ("error",) else None)
+        # Collect console errors
+        def _on_console(m):
+            try:
+                if m.type in ("error", "warning"):
+                    line = f"{m.type}: {m.text}"
+                    self.console_errors.append(line)
+            except Exception:
+                pass
+        self.page.on("console", _on_console)
         self.page.on("pageerror", lambda e: self.console_errors.append(f"pageerror: {e}"))
 
         async def _on_response(resp):
@@ -705,13 +768,11 @@ class AbcexWorker:
                 pass
         self.page.on("response", _on_response)
 
-        # стартовая загрузка один раз
+        # Initial navigation
         log.info("STEP 0: initial open spot")
         await _goto_stable(self.page, ABCEX_URL)
         await accept_cookies_if_any(self.page)
         await login_if_needed(self.page, ABCEX_EMAIL, ABCEX_PASSWORD)
-
-        # после логина ещё раз открыть
         await _goto_stable(self.page, ABCEX_URL)
 
         try:
@@ -725,7 +786,12 @@ class AbcexWorker:
         try:
             return await wait_ui_ready(self.page, timeout_ms=WAIT_UI_TIMEOUT_MS)
         except Exception as e:
-            # diag + один reload
+            # If proxy is broken (407/tunnel), don't waste time on reload; raise to switch proxy immediately
+            tail = "\n".join(self.console_errors[-20:])
+            if any(_looks_like_proxy_error_line(x) for x in self.console_errors[-20:]) or "407" in tail or "ERR_TUNNEL" in tail:
+                await log_diag(self.page, "ui_fail_proxy_like", self.net_errors, self.console_errors)
+                raise RuntimeError("UI_failed_due_to_proxy_like_errors") from e
+
             await log_diag(self.page, "ui_fail_before_reload", self.net_errors, self.console_errors)
             log.warning("UI not ready. Trying reload once... err=%s", e)
 
@@ -739,7 +805,6 @@ class AbcexWorker:
             except Exception:
                 pass
 
-            # повторная попытка
             return await wait_ui_ready(self.page, timeout_ms=WAIT_UI_TIMEOUT_MS)
 
     async def run_cycle(self) -> List[Dict[str, Any]]:
@@ -753,10 +818,8 @@ class AbcexWorker:
 
         trades = await extract_trades(panel, limit=LIMIT)
         log.info("Parsed trades (validated): %d", len(trades))
-
         for i, t in enumerate(trades[:3]):
             log.info("Sample trade[%d]: %s", i, t)
-
         return trades
 
 # ───────────────────────── MAIN LOOP ─────────────────────────
@@ -774,7 +837,7 @@ async def main() -> None:
         chain = worker._proxy_chain()
         idx = 0
 
-        # стартуем
+        # Start with first proxy option
         while True:
             try:
                 await worker.start(p, chain[idx])
@@ -823,9 +886,9 @@ async def main() -> None:
                 if worker.page:
                     await log_diag(worker.page, "cycle_error", worker.net_errors, worker.console_errors)
 
-                # если UI развалился — переключаем прокси В СЛЕДУЮЩИЙ ВАРИАНТ и пересоздаём контекст сразу
+                # Switch proxy variant and restart context
                 idx = (idx + 1) % len(chain)
-                log.warning("Switch proxy variant -> %s", chain[idx] or "OFF")
+                log.warning("Switch proxy variant -> %s", chain[idx] or "OFF (direct)")
                 try:
                     await worker.start(p, chain[idx])
                 except Exception as se:
@@ -837,4 +900,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
